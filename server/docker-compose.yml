@@ -1,0 +1,36 @@
+services:
+  clip-server:
+    build: .
+    container_name: instant-replay-share
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:8080}
+      - UPLOAD_TOKEN=${UPLOAD_TOKEN:-change-me}
+      - DATA_DIR=/data
+      - MAX_UPLOAD_MB=2048
+      - MAX_STORAGE_GB=50
+    volumes:
+      - ${CLIP_STORAGE_DIR:-./data}:/data
+
+  # Optional: Uncomment or pass CLOUDFLARE_TUNNEL_TOKEN in .env to expose securely
+  # on your custom domain without opening any ports on your router.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: instant-replay-tunnel
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - clip-server

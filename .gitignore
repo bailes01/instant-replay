@@ -1,0 +1,17 @@
+build/
+.cache/
+old/
+server/data/
+server/.env
+.env
+.env.*
+config.ini
+data/
+captures/
+server_clips/
+*.log
+*.mp4
+*.zip
+*.key
+*.pem
+*.token
