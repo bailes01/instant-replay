@@ -98,6 +98,7 @@ enum MenuIds {
     IDM_TOGGLE_DELETE_ON_UPLOAD = 1016,
     IDM_SET_OUTPUT_DIR = 1017,
     IDM_SET_UPLOAD_TOKEN = 1018,
+    IDM_SET_SERVER_URL = 1019,
     IDM_FPS_30 = 1020,
     IDM_FPS_60 = 1021,
     IDM_FPS_90 = 1022,
@@ -591,6 +592,24 @@ void TrayApp::PromptChangeOutputDir() {
                 ShowBalloon("Invalid Output Folder", "Could not create or access: " + raw);
             }
         }
+    }
+}
+
+void TrayApp::PromptChangeServerUrl() {
+    std::string raw;
+    if (PromptTextDialog(m_hInstance, L"InstantReplay - Set Server URL",
+                         L"Share server URL (e.g. https://clips.example.com):",
+                         m_config.server_url, raw)) {
+        while (!raw.empty() && (raw.front() == ' ' || raw.front() == '\t' || raw.front() == '"')) raw.erase(raw.begin());
+        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t' || raw.back() == '"' || raw.back() == '/')) raw.pop_back();
+        size_t apiPos = raw.find("/api/");
+        if (apiPos != std::string::npos) {
+            raw = raw.substr(0, apiPos);
+        }
+        m_config.server_url = raw;
+        m_config.Save(m_configPath);
+        ShowBalloon("Server URL Updated",
+                    m_config.server_url.empty() ? "Cleared server URL" : ("Server set to: " + m_config.server_url));
     }
 }
 
@@ -1185,6 +1204,10 @@ void TrayApp::ShowContextMenu() {
     std::wstring userLabel = L"Set Username... (Current: " + ToWideStr(m_config.username) + L")";
     AppendMenuW(hMenu, MF_STRING, IDM_CHANGE_USERNAME, userLabel.c_str());
 
+    std::wstring urlStatus = m_config.server_url.empty() ? L"Not Set" : ToWideStr(m_config.server_url);
+    std::wstring urlLabel = L"Set Server URL... (" + urlStatus + L")";
+    AppendMenuW(hMenu, MF_STRING, IDM_SET_SERVER_URL, urlLabel.c_str());
+
     std::wstring tokenStatus = m_config.upload_token.empty() ? L"Not Set" : L"Configured";
     std::wstring tokenLabel = L"Set Upload Token... (" + tokenStatus + L")";
     AppendMenuW(hMenu, MF_STRING, IDM_SET_UPLOAD_TOKEN, tokenLabel.c_str());
@@ -1285,6 +1308,7 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             else if (id == IDM_REBIND_HOTKEY) app->StartHotkeyRebind();
             else if (id == IDM_SET_OUTPUT_DIR) app->PromptChangeOutputDir();
             else if (id == IDM_CHANGE_USERNAME) app->PromptChangeUsername();
+            else if (id == IDM_SET_SERVER_URL) app->PromptChangeServerUrl();
             else if (id == IDM_SET_UPLOAD_TOKEN) app->PromptChangeUploadToken();
             else if (id == IDM_FPS_30) app->ChangeFps(30);
             else if (id == IDM_FPS_60) app->ChangeFps(60);

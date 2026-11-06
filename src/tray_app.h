@@ -36,6 +36,7 @@ public:
     void ChangeReplaySeconds(int seconds);
     void PromptCustomReplaySeconds();
     void PromptChangeOutputDir();
+    void PromptChangeServerUrl();
     void PromptChangeUploadToken();
     void ToggleBitrateSweep();
     void StartHotkeyRebind();

@@ -150,6 +150,7 @@ Config Config::Load(const std::string& path) {
     }
 
     bool hadUserToken = false;
+    bool hadCustomUsername = false;
 
     std::string line;
     while (std::getline(in, line)) {
@@ -208,7 +209,11 @@ Config Config::Load(const std::string& path) {
                 ParseHotkey(val, cfg.hotkey_modifiers, cfg.hotkey_vk);
             }
             else if (key == "username") {
-                if (!val.empty()) cfg.username = val;
+                std::string u = val;
+                if (!u.empty() && u != "player1" && u != "default") {
+                    cfg.username = u;
+                    hadCustomUsername = true;
+                }
             }
             else if (key == "user_token") {
                 if (!val.empty()) {
@@ -246,7 +251,7 @@ Config Config::Load(const std::string& path) {
         }
     }
     in.close();
-    if (!hadUserToken) {
+    if (!hadUserToken || !hadCustomUsername) {
         cfg.Save(path);
     }
     return cfg;

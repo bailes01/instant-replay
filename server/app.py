@@ -1095,17 +1095,25 @@ class ClipHandler(BaseHTTPRequestHandler):
         username = sanitize_username(self.headers.get("X-Username", "default"))
         user_token = self.headers.get("X-User-Token", "").strip()
 
-        # Authenticate via per-user token (associating on first use) OR global UPLOAD_TOKEN
+        # Authenticate via global UPLOAD_TOKEN and/or per-user token:
+        # 1. If a valid global UPLOAD_TOKEN is presented, always allow the upload AND
+        #    register/claim `username` with `user_token` if `username` isn't claimed yet.
+        # 2. Otherwise, allow if `user_token` matches `username` (or claims an unclaimed username).
         authed = False
-        if user_token and verify_or_register_user_token(username, user_token):
-            authed = True
-        elif UPLOAD_TOKEN:
+        has_valid_global_token = False
+        if UPLOAD_TOKEN:
             auth_hdr = self.headers.get("Authorization", "")
             if secrets.compare_digest(auth_hdr, f"Bearer {UPLOAD_TOKEN}"):
+                has_valid_global_token = True
                 authed = True
 
+        if user_token and verify_or_register_user_token(username, user_token):
+            authed = True
+        elif not has_valid_global_token:
+            authed = False
+
         if not authed:
-            self._send_json(401, {"error": "unauthorized (username already claimed by another user_token)"})
+            self._send_json(401, {"error": "unauthorized (invalid upload_token or username claimed by another user_token)"})
             return
 
         cl_str = self.headers.get("Content-Length")
