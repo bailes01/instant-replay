@@ -13,9 +13,71 @@ namespace {
 constexpr UINT WM_TRAYICON = WM_USER + 100;
 constexpr UINT WM_AUTOSAVE_TEST = WM_USER + 101;
 constexpr UINT WM_HOTKEY_REBOUND = WM_USER + 102;
+constexpr UINT WM_SHOW_OSD = WM_USER + 103;
+constexpr UINT WM_OSD_HIDE_TIMER = WM_USER + 104;
 constexpr int HOTKEY_ID_SAVE = 1;
 static TrayApp* g_trayAppInstance = nullptr;
 static ULONGLONG g_lastHookTriggerMs = 0;
+static std::mutex g_osdMutex;
+static std::wstring g_osdTitle;
+static std::wstring g_osdMessage;
+
+static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+
+        // Dark background (#141821) + subtle border (#2A3142) + green accent bar (#22E55E)
+        HBRUSH bgBrush = CreateSolidBrush(RGB(20, 24, 33));
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        HBRUSH borderBrush = CreateSolidBrush(RGB(42, 49, 66));
+        FrameRect(hdc, &rc, borderBrush);
+        DeleteObject(borderBrush);
+
+        RECT barRc = {0, 0, 5, rc.bottom};
+        HBRUSH barBrush = CreateSolidBrush(RGB(34, 229, 94));
+        FillRect(hdc, &barRc, barBrush);
+        DeleteObject(barBrush);
+
+        std::wstring title, sub;
+        {
+            std::lock_guard<std::mutex> lk(g_osdMutex);
+            title = g_osdTitle;
+            sub = g_osdMessage;
+        }
+
+        SetBkMode(hdc, TRANSPARENT);
+        HFONT hTitleFont = CreateFontW(-15, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        HFONT hSubFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
+        HGDIOBJ oldFont = SelectObject(hdc, hTitleFont);
+        SetTextColor(hdc, RGB(240, 244, 250));
+        RECT titleRc = {16, 10, rc.right - 12, 32};
+        DrawTextW(hdc, title.c_str(), -1, &titleRc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        SelectObject(hdc, hSubFont);
+        SetTextColor(hdc, RGB(154, 165, 180));
+        RECT subRc = {16, 33, rc.right - 12, rc.bottom - 8};
+        DrawTextW(hdc, sub.c_str(), -1, &subRc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        SelectObject(hdc, oldFont);
+        DeleteObject(hTitleFont);
+        DeleteObject(hSubFont);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
 
 enum MenuIds {
     IDM_SAVE_NOW = 1001,
@@ -32,6 +94,23 @@ enum MenuIds {
     IDM_AUDIO_OFF = 1012,
     IDM_CHANGE_USERNAME = 1013,
     IDM_OPEN_GALLERY = 1014,
+    IDM_COPY_LAST_LINK = 1015,
+    IDM_TOGGLE_DELETE_ON_UPLOAD = 1016,
+    IDM_SET_OUTPUT_DIR = 1017,
+    IDM_SET_UPLOAD_TOKEN = 1018,
+    IDM_FPS_30 = 1020,
+    IDM_FPS_60 = 1021,
+    IDM_FPS_90 = 1022,
+    IDM_FPS_120 = 1023,
+    IDM_FPS_144 = 1024,
+    IDM_FPS_CUSTOM = 1025,
+    IDM_REPLAY_15 = 1030,
+    IDM_REPLAY_30 = 1031,
+    IDM_REPLAY_45 = 1032,
+    IDM_REPLAY_60 = 1033,
+    IDM_REPLAY_120 = 1034,
+    IDM_REPLAY_300 = 1035,
+    IDM_REPLAY_CUSTOM = 1036,
     IDM_EXIT = 1099,
     IDM_MONITOR_BASE = 1100
 };
@@ -181,15 +260,16 @@ static HICON CreateGreenDotIcon() {
     return icon ? icon : LoadIcon(nullptr, IDI_APPLICATION);
 }
 
-// Simple modal dialog to edit the username
-struct UsernameDialogState {
+// Reusable modal text input dialog
+struct TextInputDialogState {
+    std::wstring label;
     std::wstring value;
     bool accepted = false;
     HWND hEdit = nullptr;
 };
 
-static LRESULT CALLBACK UsernameDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    auto* st = reinterpret_cast<UsernameDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+static LRESULT CALLBACK TextInputDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* st = reinterpret_cast<TextInputDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
         case WM_NCCREATE: {
             auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
@@ -198,17 +278,17 @@ static LRESULT CALLBACK UsernameDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
         case WM_CREATE: {
             HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-            HWND hLbl = CreateWindowExW(0, L"STATIC", L"Username (for server clip gallery):",
-                                        WS_CHILD | WS_VISIBLE, 14, 14, 290, 20, hwnd, nullptr, nullptr, nullptr);
+            HWND hLbl = CreateWindowExW(0, L"STATIC", st->label.c_str(),
+                                        WS_CHILD | WS_VISIBLE, 14, 14, 340, 20, hwnd, nullptr, nullptr, nullptr);
             st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", st->value.c_str(),
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                        14, 38, 290, 24, hwnd, reinterpret_cast<HMENU>(100), nullptr, nullptr);
+                                        14, 38, 340, 24, hwnd, reinterpret_cast<HMENU>(100), nullptr, nullptr);
             HWND hOk = CreateWindowExW(0, L"BUTTON", L"Save",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                       136, 74, 80, 26, hwnd, reinterpret_cast<HMENU>(IDOK), nullptr, nullptr);
+                                       186, 74, 80, 26, hwnd, reinterpret_cast<HMENU>(IDOK), nullptr, nullptr);
             HWND hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
                                            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                           224, 74, 80, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
+                                           274, 74, 80, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
             SendMessageW(hLbl, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
             SendMessageW(st->hEdit, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
             SendMessageW(hOk, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
@@ -219,8 +299,8 @@ static LRESULT CALLBACK UsernameDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
         case WM_COMMAND:
             if (LOWORD(wParam) == IDOK) {
-                wchar_t buf[128]{};
-                GetWindowTextW(st->hEdit, buf, 128);
+                wchar_t buf[512]{};
+                GetWindowTextW(st->hEdit, buf, 512);
                 st->value = buf;
                 st->accepted = true;
                 DestroyWindow(hwnd);
@@ -232,6 +312,54 @@ static LRESULT CALLBACK UsernameDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             break;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool PromptTextDialog(HINSTANCE hInstance, const wchar_t* title, const wchar_t* label,
+                             const std::string& initialUtf8, std::string& outUtf8) {
+    static bool classRegistered = false;
+    if (!classRegistered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = TextInputDlgProc;
+        wc.hInstance = hInstance;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"InstantReplayTextInputDlg";
+        RegisterClassExW(&wc);
+        classRegistered = true;
+    }
+
+    TextInputDialogState state;
+    state.label = label;
+    state.value = ToWideStr(initialUtf8);
+
+    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    int scrH = GetSystemMetrics(SM_CYSCREEN);
+    int w = 380, h = 148;
+    HWND hDlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"InstantReplayTextInputDlg",
+        title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        (scrW - w) / 2, (scrH - h) / 2, w, h,
+        nullptr, nullptr, hInstance, &state
+    );
+    if (!hDlg) return false;
+
+    SetForegroundWindow(hDlg);
+    MSG msg{};
+    while (IsWindow(hDlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(hDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    if (state.accepted) {
+        outUtf8 = WideToUtf8(state.value);
+        return true;
+    }
+    return false;
 }
 } // namespace
 
@@ -368,46 +496,9 @@ void TrayApp::StartHotkeyRebind() {
 }
 
 void TrayApp::PromptChangeUsername() {
-    static bool classRegistered = false;
-    if (!classRegistered) {
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = UsernameDlgProc;
-        wc.hInstance = m_hInstance;
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-        wc.lpszClassName = L"InstantReplayUsernameDlg";
-        RegisterClassExW(&wc);
-        classRegistered = true;
-    }
-
-    UsernameDialogState state;
-    state.value = ToWideStr(m_config.username);
-
-    int scrW = GetSystemMetrics(SM_CXSCREEN);
-    int scrH = GetSystemMetrics(SM_CYSCREEN);
-    int w = 330, h = 148;
-    HWND hDlg = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        L"InstantReplayUsernameDlg",
-        L"InstantReplay - Set Username",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        (scrW - w) / 2, (scrH - h) / 2, w, h,
-        nullptr, nullptr, m_hInstance, &state
-    );
-    if (!hDlg) return;
-
-    SetForegroundWindow(hDlg);
-    MSG msg{};
-    while (IsWindow(hDlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageW(hDlg, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-
-    if (state.accepted) {
-        std::string raw = WideToUtf8(state.value);
+    std::string raw;
+    if (PromptTextDialog(m_hInstance, L"InstantReplay - Set Username",
+                         L"Username (for server clip gallery):", m_config.username, raw)) {
         std::string clean;
         for (char c : raw) {
             if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
@@ -422,14 +513,103 @@ void TrayApp::PromptChangeUsername() {
     }
 }
 
-void TrayApp::OpenUserGallery() {
-    // Derive base URL from upload_url (strip /api/upload)
-    std::string base = m_config.upload_url;
-    size_t apiPos = base.find("/api/");
-    if (apiPos != std::string::npos) {
-        base = base.substr(0, apiPos);
+void TrayApp::CopyMostRecentUploadLink() {
+    if (m_lastShareUrl.empty()) {
+        ShowBalloon("InstantReplay", "No clip uploaded in this session yet.");
+        return;
     }
-    std::string galleryUrl = base + "/u/" + m_config.username;
+    Uploader::CopyToClipboard(m_lastShareUrl);
+    ShowBalloon("Link Copied", m_lastShareUrl);
+}
+
+void TrayApp::ChangeFps(int fps) {
+    fps = std::clamp(fps, 10, 240);
+    if (fps == m_config.fps) return;
+    m_config.fps = fps;
+    m_config.Save(m_configPath);
+    StartPipeline();
+    ShowBalloon("Frame Rate Updated", "Now recording at " + std::to_string(m_config.fps) + " FPS");
+}
+
+void TrayApp::PromptCustomFps() {
+    std::string raw;
+    if (PromptTextDialog(m_hInstance, L"InstantReplay - Custom FPS",
+                         L"Target frame rate (10 to 240 FPS):", std::to_string(m_config.fps), raw)) {
+        try {
+            int val = std::stoi(raw);
+            ChangeFps(val);
+        } catch (...) {
+            ShowBalloon("Invalid FPS", "Please enter a number between 10 and 240.");
+        }
+    }
+}
+
+void TrayApp::ChangeReplaySeconds(int seconds) {
+    seconds = std::clamp(seconds, 3, 600);
+    if (seconds == m_config.replay_seconds) return;
+    m_config.replay_seconds = seconds;
+    m_config.Save(m_configPath);
+    {
+        std::lock_guard<std::mutex> lock(m_pipelineMutex);
+        for (auto& s : m_streams) {
+            if (s.buffer) s.buffer->SetMaxSeconds(m_config.replay_seconds);
+        }
+    }
+    ShowBalloon("Replay Length Updated", "Buffer length set to last " + std::to_string(m_config.replay_seconds) + " seconds");
+}
+
+void TrayApp::PromptCustomReplaySeconds() {
+    std::string raw;
+    if (PromptTextDialog(m_hInstance, L"InstantReplay - Custom Replay Length",
+                         L"Replay buffer duration in seconds (3 to 600):",
+                         std::to_string(m_config.replay_seconds), raw)) {
+        try {
+            int val = std::stoi(raw);
+            ChangeReplaySeconds(val);
+        } catch (...) {
+            ShowBalloon("Invalid Replay Length", "Please enter a number between 3 and 600.");
+        }
+    }
+}
+
+void TrayApp::PromptChangeOutputDir() {
+    std::string raw;
+    if (PromptTextDialog(m_hInstance, L"InstantReplay - Set Output Directory",
+                         L"Folder path for saved clips (e.g. D:/Clips/ or captures/):",
+                         m_config.output_dir, raw)) {
+        while (!raw.empty() && (raw.front() == ' ' || raw.front() == '\t' || raw.front() == '"')) raw.erase(raw.begin());
+        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t' || raw.back() == '"')) raw.pop_back();
+        if (!raw.empty()) {
+            if (raw.back() != '/' && raw.back() != '\\') raw += '/';
+            std::error_code ec;
+            std::filesystem::create_directories(raw, ec);
+            if (!ec && std::filesystem::exists(raw)) {
+                m_config.output_dir = raw;
+                m_config.Save(m_configPath);
+                ShowBalloon("Output Folder Updated", "Saving clips to: " + m_config.output_dir);
+            } else {
+                ShowBalloon("Invalid Output Folder", "Could not create or access: " + raw);
+            }
+        }
+    }
+}
+
+void TrayApp::PromptChangeUploadToken() {
+    std::string raw;
+    if (PromptTextDialog(m_hInstance, L"InstantReplay - Set Upload Token",
+                         L"Server upload bearer token (leave blank if none):",
+                         m_config.upload_token, raw)) {
+        while (!raw.empty() && (raw.front() == ' ' || raw.front() == '\t')) raw.erase(raw.begin());
+        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t')) raw.pop_back();
+        m_config.upload_token = raw;
+        m_config.Save(m_configPath);
+        ShowBalloon("Upload Token Updated",
+                    m_config.upload_token.empty() ? "Cleared upload token" : "Saved new upload bearer token");
+    }
+}
+
+void TrayApp::OpenUserGallery() {
+    std::string galleryUrl = m_config.GetGalleryUrl();
     ShellExecuteW(nullptr, L"open", ToWideStr(galleryUrl).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
@@ -461,6 +641,22 @@ bool TrayApp::Init(HINSTANCE hInstance, const std::string& configPath, int autoS
     if (!m_hwnd) {
         LOG_ERROR("Failed to create message window.");
         return false;
+    }
+
+    WNDCLASSEXW osdWc{};
+    osdWc.cbSize = sizeof(osdWc);
+    osdWc.lpfnWndProc = OsdWndProc;
+    osdWc.hInstance = hInstance;
+    osdWc.lpszClassName = L"InstantReplayOsdToast";
+    RegisterClassExW(&osdWc);
+
+    m_osdHwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        osdWc.lpszClassName, L"", WS_POPUP,
+        0, 0, 350, 60, nullptr, nullptr, hInstance, nullptr
+    );
+    if (m_osdHwnd) {
+        SetLayeredWindowAttributes(m_osdHwnd, 0, 238, LWA_ALPHA);
     }
 
     m_icon = CreateGreenDotIcon();
@@ -797,13 +993,26 @@ void TrayApp::SaveWorker(
         m_lastSavedPath = primarySaved;
         m_lastSavedAppName = recordedAppName;
         if (m_config.auto_upload) {
+            ShowBalloon("Replay Saved (" + recordedAppName + ")",
+                        "Saved last " + std::to_string(m_config.replay_seconds) + "s — uploading clip...");
             std::string shareUrl;
-            if (Uploader::UploadFile(primarySaved, m_config.upload_url, m_config.upload_token,
-                                     m_config.username, recordedAppName, shareUrl)) {
+            if (Uploader::UploadFile(primarySaved, m_config.GetUploadEndpoint(), m_config.upload_token,
+                                     m_config.username, m_config.user_token, recordedAppName, shareUrl)) {
+                m_lastShareUrl = shareUrl;
                 if (m_config.copy_link_to_clipboard) {
                     Uploader::CopyToClipboard(shareUrl);
                 }
-                ShowBalloon("Replay Saved & Uploaded", "Share link copied: " + shareUrl);
+                if (m_config.delete_after_upload) {
+                    std::error_code delEc;
+                    std::filesystem::remove(primarySaved, delEc);
+                    if (!delEc) {
+                        LOG_INFO("Deleted local video after upload: %s", primarySaved.c_str());
+                        if (m_lastSavedPath == primarySaved) m_lastSavedPath.clear();
+                    }
+                    ShowBalloon("Uploaded & Local File Deleted", "Share link copied: " + shareUrl);
+                } else {
+                    ShowBalloon("Replay Uploaded", "Share link copied: " + shareUrl);
+                }
             } else {
                 ShowBalloon("Replay Saved (Upload Failed)", primarySaved);
             }
@@ -833,14 +1042,25 @@ void TrayApp::UploadLatestClip() {
     std::thread([this, path, appName]() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
         std::string shareUrl;
-        if (Uploader::UploadFile(path, m_config.upload_url, m_config.upload_token,
-                                 m_config.username, appName, shareUrl)) {
+        if (Uploader::UploadFile(path, m_config.GetUploadEndpoint(), m_config.upload_token,
+                                 m_config.username, m_config.user_token, appName, shareUrl)) {
+            m_lastShareUrl = shareUrl;
             if (m_config.copy_link_to_clipboard) {
                 Uploader::CopyToClipboard(shareUrl);
             }
-            ShowBalloon("Clip Uploaded", "Share link copied: " + shareUrl);
+            if (m_config.delete_after_upload) {
+                std::error_code delEc;
+                std::filesystem::remove(path, delEc);
+                if (!delEc) {
+                    LOG_INFO("Deleted local video after upload: %s", path.c_str());
+                    if (m_lastSavedPath == path) m_lastSavedPath.clear();
+                }
+                ShowBalloon("Clip Uploaded & Local Deleted", "Share link copied: " + shareUrl);
+            } else {
+                ShowBalloon("Clip Uploaded", "Share link copied: " + shareUrl);
+            }
         } else {
-            ShowBalloon("Upload Failed", "Check server status and upload_url in config.ini");
+            ShowBalloon("Upload Failed", "Check server status and server_url in config.ini");
         }
     }).detach();
 }
@@ -871,12 +1091,19 @@ void TrayApp::ReloadConfig() {
 
 void TrayApp::ShowBalloon(const std::string& title, const std::string& message) {
     if (!m_hwnd) return;
+    {
+        std::lock_guard<std::mutex> lk(g_osdMutex);
+        g_osdTitle = ToWideStr(title);
+        g_osdMessage = ToWideStr(message);
+    }
+    PostMessageW(m_hwnd, WM_SHOW_OSD, 0, 0);
+
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd = m_hwnd;
     nid.uID = 1;
-    nid.uFlags = NIF_INFO;
-    nid.dwInfoFlags = NIIF_INFO;
+    nid.uFlags = NIF_INFO | NIF_REALTIME;
+    nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
     wcsncpy_s(nid.szInfoTitle, ToWideStr(title).c_str(), _TRUNCATE);
     wcsncpy_s(nid.szInfo, ToWideStr(message).c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -889,6 +1116,8 @@ void TrayApp::ShowContextMenu() {
     AppendMenuW(hMenu, MF_STRING, IDM_SAVE_NOW, saveLabel.c_str());
     AppendMenuW(hMenu, MF_STRING | (m_lastSavedPath.empty() ? MF_GRAYED : 0),
                 IDM_UPLOAD_LAST, L"Upload Last Saved Clip && Copy Link");
+    AppendMenuW(hMenu, MF_STRING | (m_lastShareUrl.empty() ? MF_GRAYED : 0),
+                IDM_COPY_LAST_LINK, L"Copy Link for Most Recent Upload");
     std::wstring galleryLabel = L"Open My Clip Gallery (" + ToWideStr(m_config.username) + L")";
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GALLERY, galleryLabel.c_str());
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -900,6 +1129,42 @@ void TrayApp::ShowContextMenu() {
         AppendMenuW(hMonMenu, flags, IDM_MONITOR_BASE + m.index, ToWideStr(m.name).c_str());
     }
     AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hMonMenu), L"Select Monitor");
+
+    // FPS submenu
+    HMENU hFpsMenu = CreatePopupMenu();
+    const int fpsPresets[] = {30, 60, 90, 120, 144};
+    const int fpsIds[]     = {IDM_FPS_30, IDM_FPS_60, IDM_FPS_90, IDM_FPS_120, IDM_FPS_144};
+    bool fpsMatched = false;
+    for (size_t i = 0; i < 5; ++i) {
+        bool checked = (m_config.fps == fpsPresets[i]);
+        if (checked) fpsMatched = true;
+        std::wstring lbl = std::to_wstring(fpsPresets[i]) + L" FPS";
+        AppendMenuW(hFpsMenu, MF_STRING | (checked ? MF_CHECKED : 0), fpsIds[i], lbl.c_str());
+    }
+    std::wstring customFpsLbl = fpsMatched
+        ? L"Custom..."
+        : (L"Custom (" + std::to_wstring(m_config.fps) + L" FPS)...");
+    AppendMenuW(hFpsMenu, MF_STRING | (!fpsMatched ? MF_CHECKED : 0), IDM_FPS_CUSTOM, customFpsLbl.c_str());
+    std::wstring fpsRootLbl = L"Frame Rate (" + std::to_wstring(m_config.fps) + L" FPS)";
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hFpsMenu), fpsRootLbl.c_str());
+
+    // Replay Seconds submenu
+    HMENU hRepMenu = CreatePopupMenu();
+    const int repPresets[] = {15, 30, 45, 60, 120, 300};
+    const int repIds[]     = {IDM_REPLAY_15, IDM_REPLAY_30, IDM_REPLAY_45, IDM_REPLAY_60, IDM_REPLAY_120, IDM_REPLAY_300};
+    bool repMatched = false;
+    for (size_t i = 0; i < 6; ++i) {
+        bool checked = (m_config.replay_seconds == repPresets[i]);
+        if (checked) repMatched = true;
+        std::wstring lbl = std::to_wstring(repPresets[i]) + L" seconds";
+        AppendMenuW(hRepMenu, MF_STRING | (checked ? MF_CHECKED : 0), repIds[i], lbl.c_str());
+    }
+    std::wstring customRepLbl = repMatched
+        ? L"Custom..."
+        : (L"Custom (" + std::to_wstring(m_config.replay_seconds) + L"s)...");
+    AppendMenuW(hRepMenu, MF_STRING | (!repMatched ? MF_CHECKED : 0), IDM_REPLAY_CUSTOM, customRepLbl.c_str());
+    std::wstring repRootLbl = L"Replay Length (" + std::to_wstring(m_config.replay_seconds) + L"s)";
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hRepMenu), repRootLbl.c_str());
 
     // Audio mode submenu
     HMENU hAudMenu = CreatePopupMenu();
@@ -914,13 +1179,22 @@ void TrayApp::ShowContextMenu() {
     std::wstring rebindLabel = L"Change Save Hotkey... (Current: " + ToWideStr(m_config.hotkey_string) + L")";
     AppendMenuW(hMenu, MF_STRING, IDM_REBIND_HOTKEY, rebindLabel.c_str());
 
+    std::wstring outDirLabel = L"Set Output Folder... (" + ToWideStr(m_config.output_dir) + L")";
+    AppendMenuW(hMenu, MF_STRING, IDM_SET_OUTPUT_DIR, outDirLabel.c_str());
+
     std::wstring userLabel = L"Set Username... (Current: " + ToWideStr(m_config.username) + L")";
     AppendMenuW(hMenu, MF_STRING, IDM_CHANGE_USERNAME, userLabel.c_str());
 
-    AppendMenuW(hMenu, MF_STRING | (m_config.debug_bitrate_sweep ? MF_CHECKED : 0),
-                IDM_TOGGLE_SWEEP, L"Debug: Bitrate Sweep Mode");
+    std::wstring tokenStatus = m_config.upload_token.empty() ? L"Not Set" : L"Configured";
+    std::wstring tokenLabel = L"Set Upload Token... (" + tokenStatus + L")";
+    AppendMenuW(hMenu, MF_STRING, IDM_SET_UPLOAD_TOKEN, tokenLabel.c_str());
+
     AppendMenuW(hMenu, MF_STRING | (m_config.auto_upload ? MF_CHECKED : 0),
                 IDM_TOGGLE_AUTOUPLOAD, L"Auto-Upload on Save");
+    AppendMenuW(hMenu, MF_STRING | (m_config.delete_after_upload ? MF_CHECKED : 0),
+                IDM_TOGGLE_DELETE_ON_UPLOAD, L"Delete Local Video After Upload");
+    AppendMenuW(hMenu, MF_STRING | (m_config.debug_bitrate_sweep ? MF_CHECKED : 0),
+                IDM_TOGGLE_SWEEP, L"Debug: Bitrate Sweep Mode");
     AppendMenuW(hMenu, MF_STRING | (IsStartWithWindowsEnabled() ? MF_CHECKED : 0),
                 IDM_TOGGLE_AUTORUN, L"Start with Windows (Always Recording)");
 
@@ -968,11 +1242,28 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             }
             return 0;
 
+        case WM_SHOW_OSD:
+            if (app->m_osdHwnd) {
+                int scrW = GetSystemMetrics(SM_CXSCREEN);
+                int w = 350, h = 60;
+                SetWindowPos(app->m_osdHwnd, HWND_TOPMOST, scrW - w - 24, 24, w, h,
+                             SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                InvalidateRect(app->m_osdHwnd, nullptr, TRUE);
+                UpdateWindow(app->m_osdHwnd);
+                SetTimer(hwnd, WM_OSD_HIDE_TIMER, 3200, nullptr);
+            }
+            return 0;
+
         case WM_TIMER:
             if (wParam == WM_AUTOSAVE_TEST) {
                 KillTimer(hwnd, WM_AUTOSAVE_TEST);
                 LOG_INFO("Auto-save timer fired; saving replay clip now.");
                 app->TriggerSaveReplay();
+            } else if (wParam == WM_OSD_HIDE_TIMER) {
+                KillTimer(hwnd, WM_OSD_HIDE_TIMER);
+                if (app->m_osdHwnd) {
+                    ShowWindow(app->m_osdHwnd, SW_HIDE);
+                }
             }
             return 0;
 
@@ -989,9 +1280,25 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             int id = LOWORD(wParam);
             if (id == IDM_SAVE_NOW) app->TriggerSaveReplay();
             else if (id == IDM_UPLOAD_LAST) app->UploadLatestClip();
+            else if (id == IDM_COPY_LAST_LINK) app->CopyMostRecentUploadLink();
             else if (id == IDM_OPEN_GALLERY) app->OpenUserGallery();
             else if (id == IDM_REBIND_HOTKEY) app->StartHotkeyRebind();
+            else if (id == IDM_SET_OUTPUT_DIR) app->PromptChangeOutputDir();
             else if (id == IDM_CHANGE_USERNAME) app->PromptChangeUsername();
+            else if (id == IDM_SET_UPLOAD_TOKEN) app->PromptChangeUploadToken();
+            else if (id == IDM_FPS_30) app->ChangeFps(30);
+            else if (id == IDM_FPS_60) app->ChangeFps(60);
+            else if (id == IDM_FPS_90) app->ChangeFps(90);
+            else if (id == IDM_FPS_120) app->ChangeFps(120);
+            else if (id == IDM_FPS_144) app->ChangeFps(144);
+            else if (id == IDM_FPS_CUSTOM) app->PromptCustomFps();
+            else if (id == IDM_REPLAY_15) app->ChangeReplaySeconds(15);
+            else if (id == IDM_REPLAY_30) app->ChangeReplaySeconds(30);
+            else if (id == IDM_REPLAY_45) app->ChangeReplaySeconds(45);
+            else if (id == IDM_REPLAY_60) app->ChangeReplaySeconds(60);
+            else if (id == IDM_REPLAY_120) app->ChangeReplaySeconds(120);
+            else if (id == IDM_REPLAY_300) app->ChangeReplaySeconds(300);
+            else if (id == IDM_REPLAY_CUSTOM) app->PromptCustomReplaySeconds();
             else if (id == IDM_OPEN_FOLDER) {
                 ShellExecuteW(nullptr, L"open", ToWideStr(app->m_config.output_dir).c_str(),
                               nullptr, nullptr, SW_SHOWNORMAL);
@@ -1004,6 +1311,10 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             else if (id == IDM_TOGGLE_SWEEP) app->ToggleBitrateSweep();
             else if (id == IDM_TOGGLE_AUTOUPLOAD) {
                 app->m_config.auto_upload = !app->m_config.auto_upload;
+                app->m_config.Save(app->m_configPath);
+            }
+            else if (id == IDM_TOGGLE_DELETE_ON_UPLOAD) {
+                app->m_config.delete_after_upload = !app->m_config.delete_after_upload;
                 app->m_config.Save(app->m_configPath);
             }
             else if (id == IDM_TOGGLE_AUTORUN) {
@@ -1051,6 +1362,10 @@ void TrayApp::Shutdown() {
     if (m_kbHook) {
         UnhookWindowsHookEx(m_kbHook);
         m_kbHook = nullptr;
+    }
+    if (m_osdHwnd) {
+        DestroyWindow(m_osdHwnd);
+        m_osdHwnd = nullptr;
     }
     if (m_hwnd) {
         if (m_hotkeyRegistered) {

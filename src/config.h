@@ -39,10 +39,24 @@ struct Config {
 
     // Upload server settings
     std::string username = "player1";
-    bool auto_upload = false;
-    std::string upload_url = "http://localhost:8080/api/upload";
-    std::string upload_token = "change-me-in-config";
+    std::string user_token = "";
+    bool auto_upload = true;
+    bool delete_after_upload = false;
+    std::string server_url = "";
+    std::string upload_token = "";
     bool copy_link_to_clipboard = true;
+
+    std::string GetUploadEndpoint() const {
+        std::string base = server_url;
+        while (!base.empty() && base.back() == '/') base.pop_back();
+        return base + "/api/upload";
+    }
+
+    std::string GetGalleryUrl() const {
+        std::string base = server_url;
+        while (!base.empty() && base.back() == '/') base.pop_back();
+        return base + "/u/" + username + "?token=" + user_token;
+    }
 
     static Config Load(const std::string& path = "config.ini");
     bool Save(const std::string& path = "config.ini") const;

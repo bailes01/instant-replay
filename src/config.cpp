@@ -4,6 +4,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <random>
 
 static std::string Trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
@@ -23,16 +24,56 @@ static void ParseHotkey(const std::string& str, UINT& mods, UINT& vk) {
     std::stringstream ss(str);
     std::string token;
     while (std::getline(ss, token, '+')) {
-        std::string t = ToLower(Trim(token));
+        std::string rawTok = Trim(token);
+        std::string t = ToLower(rawTok);
         if (t == "alt") mods |= MOD_ALT;
         else if (t == "ctrl" || t == "control") mods |= MOD_CONTROL;
         else if (t == "shift") mods |= MOD_SHIFT;
         else if (t == "win") mods |= MOD_WIN;
-        else if (t.size() >= 2 && t[0] == 'f' && std::isdigit(t[1])) {
+        else if (t.size() >= 2 && t[0] == 'f' && std::isdigit(static_cast<unsigned char>(t[1]))) {
             int fnum = std::stoi(t.substr(1));
             if (fnum >= 1 && fnum <= 24) vk = VK_F1 + (fnum - 1);
-        } else if (t.size() == 1 && std::isalnum(t[0])) {
-            vk = std::toupper(t[0]);
+        } else if (t.size() > 3 && t.rfind("key", 0) == 0 && std::isdigit(static_cast<unsigned char>(t[3]))) {
+            vk = static_cast<UINT>(std::stoi(t.substr(3)));
+        } else if (t.size() == 1 && std::isalnum(static_cast<unsigned char>(t[0]))) {
+            vk = static_cast<UINT>(std::toupper(static_cast<unsigned char>(t[0])));
+        } else if (t.size() == 1) {
+            switch (t[0]) {
+                case '[': vk = VK_OEM_4; break;
+                case ']': vk = VK_OEM_6; break;
+                case '\\': vk = VK_OEM_5; break;
+                case ';': vk = VK_OEM_1; break;
+                case '\'': vk = VK_OEM_7; break;
+                case ',': vk = VK_OEM_COMMA; break;
+                case '.': vk = VK_OEM_PERIOD; break;
+                case '/': vk = VK_OEM_2; break;
+                case '-': vk = VK_OEM_MINUS; break;
+                case '=': vk = VK_OEM_PLUS; break;
+                case '`': vk = VK_OEM_3; break;
+                default: {
+                    SHORT scan = VkKeyScanA(t[0]);
+                    if (scan != -1) vk = static_cast<UINT>(LOBYTE(scan));
+                    break;
+                }
+            }
+        } else if (!rawTok.empty()) {
+            // Match localized key names from GetKeyNameTextW (e.g. "Page Up", "Insert", "]")
+            for (UINT candidate = 8; candidate <= 254; ++candidate) {
+                UINT scan = MapVirtualKeyW(candidate, MAPVK_VK_TO_VSC);
+                if (scan == 0) continue;
+                wchar_t keyName[64]{};
+                if (GetKeyNameTextW(static_cast<LONG>(scan << 16), keyName, 64) > 0) {
+                    int len = WideCharToMultiByte(CP_UTF8, 0, keyName, -1, nullptr, 0, nullptr, nullptr);
+                    if (len > 1) {
+                        std::string kStr(len - 1, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, keyName, -1, kStr.data(), len - 1, nullptr, nullptr);
+                        if (ToLower(kStr) == t) {
+                            vk = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -52,15 +93,63 @@ static std::string GetDefaultWindowsUsername() {
     return "player1";
 }
 
+static std::string GenerateOrLoadUserToken() {
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\InstantReplay", 0, nullptr,
+                        0, KEY_READ | KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        char buf[128]{};
+        DWORD sz = sizeof(buf) - 1;
+        DWORD type = 0;
+        if (RegQueryValueExA(hKey, "UserToken", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS &&
+            type == REG_SZ && sz > 8 && buf[0] != '\0') {
+            RegCloseKey(hKey);
+            return std::string(buf);
+        }
+    }
+
+    static const char kChars[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    std::random_device rd;
+    std::mt19937_64 gen((static_cast<uint64_t>(rd()) << 32) ^ rd() ^ GetTickCount64());
+    std::uniform_int_distribution<size_t> dist(0, sizeof(kChars) - 2);
+    std::string token;
+    token.reserve(32);
+    for (int i = 0; i < 32; ++i) {
+        token.push_back(kChars[dist(gen)]);
+    }
+
+    if (hKey) {
+        RegSetValueExA(hKey, "UserToken", 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(token.c_str()),
+                       static_cast<DWORD>(token.size() + 1));
+        RegCloseKey(hKey);
+    }
+    return token;
+}
+
+static void SaveUserTokenToRegistry(const std::string& token) {
+    if (token.empty()) return;
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\InstantReplay", 0, nullptr,
+                        0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, "UserToken", 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(token.c_str()),
+                       static_cast<DWORD>(token.size() + 1));
+        RegCloseKey(hKey);
+    }
+}
+
 Config Config::Load(const std::string& path) {
     Config cfg;
     cfg.username = GetDefaultWindowsUsername();
+    cfg.user_token = GenerateOrLoadUserToken();
     std::ifstream in(path);
     if (!in.is_open()) {
-        LOG_INFO("Config file '%s' not found; writing defaults.", path.c_str());
+        LOG_INFO("Config file '%s' not found; writing defaults with generated user_token.", path.c_str());
         cfg.Save(path);
         return cfg;
     }
+
+    bool hadUserToken = false;
 
     std::string line;
     while (std::getline(in, line)) {
@@ -121,19 +210,44 @@ Config Config::Load(const std::string& path) {
             else if (key == "username") {
                 if (!val.empty()) cfg.username = val;
             }
+            else if (key == "user_token") {
+                if (!val.empty()) {
+                    cfg.user_token = val;
+                    SaveUserTokenToRegistry(val);
+                    hadUserToken = true;
+                }
+            }
             else if (key == "auto_upload") {
                 std::string v = ToLower(val);
                 cfg.auto_upload = (v == "true" || v == "1" || v == "yes");
             }
-            else if (key == "upload_url") cfg.upload_url = val;
+            else if (key == "server_url" || key == "upload_url") {
+                std::string u = val;
+                size_t apiPos = u.find("/api/");
+                if (apiPos != std::string::npos) {
+                    u = u.substr(0, apiPos);
+                }
+                while (!u.empty() && u.back() == '/') u.pop_back();
+                if (!u.empty() && u != "http://localhost:8080") {
+                    cfg.server_url = u;
+                }
+            }
             else if (key == "upload_token") cfg.upload_token = val;
             else if (key == "copy_link_to_clipboard") {
                 std::string v = ToLower(val);
                 cfg.copy_link_to_clipboard = (v == "true" || v == "1" || v == "yes");
             }
+            else if (key == "delete_after_upload" || key == "delete_video_on_upload") {
+                std::string v = ToLower(val);
+                cfg.delete_after_upload = (v == "true" || v == "1" || v == "yes");
+            }
         } catch (...) {
             LOG_WARN("Invalid config value for key '%s': '%s'", key.c_str(), val.c_str());
         }
+    }
+    in.close();
+    if (!hadUserToken) {
+        cfg.Save(path);
     }
     return cfg;
 }
@@ -176,8 +290,10 @@ bool Config::Save(const std::string& path) const {
         << "audio_bitrate_kbps = " << audio_bitrate_kbps << "\n\n"
         << "[upload]\n"
         << "username = " << username << "\n"
+        << "user_token = " << user_token << "\n"
         << "auto_upload = " << (auto_upload ? "true" : "false") << "\n"
-        << "upload_url = " << upload_url << "\n"
+        << "delete_after_upload = " << (delete_after_upload ? "true" : "false") << "\n"
+        << "server_url = " << server_url << "\n"
         << "upload_token = " << upload_token << "\n"
         << "copy_link_to_clipboard = " << (copy_link_to_clipboard ? "true" : "false") << "\n";
 

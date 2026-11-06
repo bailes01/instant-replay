@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY app.py /app/app.py
 
@@ -8,8 +10,7 @@ USER appuser
 
 ENV PORT=8080 \
     DATA_DIR=/data \
-    PUBLIC_URL=http://localhost:8080 \
-    UPLOAD_TOKEN=change-me
+    PUBLIC_URL=http://localhost:8080
 
 VOLUME ["/data"]
 EXPOSE 8080

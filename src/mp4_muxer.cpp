@@ -351,8 +351,9 @@ bool Mp4Muxer::WriteClip(
         ftyp.endBox(p);
     }
 
-    // Helper that builds the entire moov box given exact file offsets for videoChunkOffset and audioChunkOffset
-    auto buildMoov = [&](uint32_t videoChunkOffset, uint32_t audioChunkOffset) -> std::vector<uint8_t> {
+    // Helper that builds the entire moov box given exact file offsets for each video and audio sample
+    auto buildMoov = [&](const std::vector<uint32_t>& videoOffsets,
+                         const std::vector<uint32_t>& audioOffsets) -> std::vector<uint8_t> {
         ByteWriter moov;
         size_t pMoov = moov.beginBox("moov");
 
@@ -484,12 +485,12 @@ bool Mp4Muxer::WriteClip(
                             for (uint32_t s : syncSamples) moov.u32(s);
                             moov.endBox(pStss);
                         }
-                        // stsc (1 chunk containing all video samples)
+                        // stsc (1 sample per chunk for chronological A/V interleaving)
                         {
                             size_t pStsc = moov.beginFullBox("stsc", 0, 0);
                             moov.u32(1);
                             moov.u32(1); // first_chunk = 1
-                            moov.u32(static_cast<uint32_t>(videoSizes.size()));
+                            moov.u32(1); // samples_per_chunk = 1
                             moov.u32(1); // sample_description_index = 1
                             moov.endBox(pStsc);
                         }
@@ -504,8 +505,8 @@ bool Mp4Muxer::WriteClip(
                         // stco
                         {
                             size_t pStco = moov.beginFullBox("stco", 0, 0);
-                            moov.u32(1);
-                            moov.u32(videoChunkOffset);
+                            moov.u32(static_cast<uint32_t>(videoOffsets.size()));
+                            for (uint32_t off : videoOffsets) moov.u32(off);
                             moov.endBox(pStco);
                         }
                         moov.endBox(pStbl);
@@ -604,12 +605,12 @@ bool Mp4Muxer::WriteClip(
                             moov.u32(1024);
                             moov.endBox(pStts);
                         }
-                        // stsc
+                        // stsc (1 sample per chunk for chronological A/V interleaving)
                         {
                             size_t pStsc = moov.beginFullBox("stsc", 0, 0);
                             moov.u32(1);
                             moov.u32(1);
-                            moov.u32(static_cast<uint32_t>(audioSizes.size()));
+                            moov.u32(1);
                             moov.u32(1);
                             moov.endBox(pStsc);
                         }
@@ -624,8 +625,8 @@ bool Mp4Muxer::WriteClip(
                         // stco
                         {
                             size_t pStco = moov.beginFullBox("stco", 0, 0);
-                            moov.u32(1);
-                            moov.u32(audioChunkOffset);
+                            moov.u32(static_cast<uint32_t>(audioOffsets.size()));
+                            for (uint32_t off : audioOffsets) moov.u32(off);
                             moov.endBox(pStco);
                         }
                         moov.endBox(pStbl);
@@ -642,18 +643,42 @@ bool Mp4Muxer::WriteClip(
     };
 
     // Pass 1: compute exact size of moov
-    auto dummyMoov = buildMoov(0, 0);
+    std::vector<uint32_t> videoOffsets(videoSizes.size(), 0);
+    std::vector<uint32_t> audioOffsets(audioSizes.size(), 0);
+    auto dummyMoov = buildMoov(videoOffsets, audioOffsets);
+
     uint32_t totalVideoBytes = 0;
     for (uint32_t sz : videoSizes) totalVideoBytes += sz;
     uint32_t totalAudioBytes = 0;
     for (uint32_t sz : audioSizes) totalAudioBytes += sz;
 
     uint32_t mdatHeaderOffset = static_cast<uint32_t>(ftyp.buf.size() + dummyMoov.size());
-    uint32_t videoChunkOffset = mdatHeaderOffset + 8; // after 8-byte mdat header
-    uint32_t audioChunkOffset = videoChunkOffset + totalVideoBytes;
+    uint32_t curOffset = mdatHeaderOffset + 8; // after 8-byte mdat header
 
-    // Pass 2: build final moov with exact offsets
-    auto finalMoov = buildMoov(videoChunkOffset, audioChunkOffset);
+    // Compute interleaved sample offsets in chronological order by timestamp_us
+    {
+        size_t vIdx = 0, aIdx = 0;
+        while (vIdx < videoSizes.size() || aIdx < audioSizes.size()) {
+            bool takeVideo = false;
+            if (vIdx < videoSizes.size() && aIdx < audioSizes.size()) {
+                takeVideo = (snapshot.video_packets[vIdx].timestamp_us <= snapshot.audio_packets[aIdx].timestamp_us);
+            } else {
+                takeVideo = (vIdx < videoSizes.size());
+            }
+            if (takeVideo) {
+                videoOffsets[vIdx] = curOffset;
+                curOffset += videoSizes[vIdx];
+                vIdx++;
+            } else {
+                audioOffsets[aIdx] = curOffset;
+                curOffset += audioSizes[aIdx];
+                aIdx++;
+            }
+        }
+    }
+
+    // Pass 2: build final moov with exact interleaved offsets
+    auto finalMoov = buildMoov(videoOffsets, audioOffsets);
 
     std::ofstream out(filePath, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
@@ -664,7 +689,7 @@ bool Mp4Muxer::WriteClip(
     out.write(reinterpret_cast<const char*>(ftyp.buf.data()), ftyp.buf.size());
     out.write(reinterpret_cast<const char*>(finalMoov.data()), finalMoov.size());
 
-    // Write mdat header + video chunk + audio chunk
+    // Write mdat header + chronologically interleaved video & audio samples
     uint32_t mdatSize = 8 + totalVideoBytes + totalAudioBytes;
     uint8_t mdatHdr[8] = {
         static_cast<uint8_t>((mdatSize >> 24) & 0xFF),
@@ -675,11 +700,24 @@ bool Mp4Muxer::WriteClip(
     };
     out.write(reinterpret_cast<const char*>(mdatHdr), 8);
 
-    for (const auto& vp : videoPayloads) {
-        out.write(reinterpret_cast<const char*>(vp.data()), vp.size());
-    }
-    for (const auto& ap : snapshot.audio_packets) {
-        out.write(reinterpret_cast<const char*>(ap.data.data()), ap.data.size());
+    {
+        size_t vIdx = 0, aIdx = 0;
+        while (vIdx < videoPayloads.size() || aIdx < snapshot.audio_packets.size()) {
+            bool takeVideo = false;
+            if (vIdx < videoPayloads.size() && aIdx < snapshot.audio_packets.size()) {
+                takeVideo = (snapshot.video_packets[vIdx].timestamp_us <= snapshot.audio_packets[aIdx].timestamp_us);
+            } else {
+                takeVideo = (vIdx < videoPayloads.size());
+            }
+            if (takeVideo) {
+                out.write(reinterpret_cast<const char*>(videoPayloads[vIdx].data()), videoPayloads[vIdx].size());
+                vIdx++;
+            } else {
+                out.write(reinterpret_cast<const char*>(snapshot.audio_packets[aIdx].data.data()),
+                          snapshot.audio_packets[aIdx].data.size());
+                aIdx++;
+            }
+        }
     }
 
     out.close();

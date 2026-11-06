@@ -5,6 +5,8 @@
 #include <fstream>
 #include <vector>
 #include <filesystem>
+#include <random>
+#include <algorithm>
 
 static std::wstring ToWide(const std::string& utf8) {
     if (utf8.empty()) return L"";
@@ -34,11 +36,25 @@ static std::string SanitizeHeaderVal(std::string s) {
     return s;
 }
 
+static std::string GenerateUploadId() {
+    static const char kChars[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    std::random_device rd;
+    std::mt19937_64 gen((static_cast<uint64_t>(rd()) << 32) ^ rd() ^ GetTickCount64());
+    std::uniform_int_distribution<size_t> dist(0, sizeof(kChars) - 2);
+    std::string id;
+    id.reserve(16);
+    for (int i = 0; i < 16; ++i) {
+        id.push_back(kChars[dist(gen)]);
+    }
+    return id;
+}
+
 bool Uploader::UploadFile(
     const std::string& filePath,
     const std::string& uploadUrl,
     const std::string& bearerToken,
     const std::string& username,
+    const std::string& userToken,
     const std::string& appName,
     std::string& outShareUrl
 ) {
@@ -49,6 +65,10 @@ bool Uploader::UploadFile(
     }
     uint64_t fileSize = static_cast<uint64_t>(in.tellg());
     in.seekg(0, std::ios::beg);
+    if (fileSize == 0) {
+        LOG_ERROR("Uploader: file '%s' is empty", filePath.c_str());
+        return false;
+    }
 
     std::wstring wUrl = ToWide(uploadUrl);
     URL_COMPONENTS urlComp{};
@@ -71,87 +91,125 @@ bool Uploader::UploadFile(
                                      WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
 
+    // Allow generous send/receive timeouts for large clip uploads
+    WinHttpSetTimeouts(hSession, 15000, 15000, 180000, 180000);
+
     HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
     if (!hConnect) {
         WinHttpCloseHandle(hSession);
         return false;
     }
 
-    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", urlPath,
-                                            nullptr, WINHTTP_NO_REFERER,
-                                            WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return false;
+    // Split uploads into <= 40 MB chunks so Cloudflare Free / Tunnel (100 MB limit) never returns 413
+    constexpr uint64_t kMaxChunkBytes = 40ULL * 1024ULL * 1024ULL;
+    const uint64_t totalChunks = (fileSize + kMaxChunkBytes - 1) / kMaxChunkBytes;
+    const std::string uploadId = (totalChunks > 1) ? GenerateUploadId() : "";
+    const std::string filename = std::filesystem::path(filePath).filename().string();
+    const DWORD reqFlags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+
+    if (totalChunks > 1) {
+        LOG_INFO("Uploading '%s' (%.2f MB) in %llu chunks of up to 40 MB...",
+                 filename.c_str(), fileSize / (1024.0 * 1024.0), (unsigned long long)totalChunks);
     }
 
-    std::string filename = std::filesystem::path(filePath).filename().string();
-    std::string headersUtf8 = "Content-Type: video/mp4\r\n"
-                              "Authorization: Bearer " + SanitizeHeaderVal(bearerToken) + "\r\n"
-                              "X-Filename: " + SanitizeHeaderVal(filename) + "\r\n"
-                              "X-Username: " + SanitizeHeaderVal(username) + "\r\n"
-                              "X-App-Name: " + SanitizeHeaderVal(appName) + "\r\n";
-    std::wstring headersWide = ToWide(headersUtf8);
+    std::vector<char> ioBuf(256 * 1024);
+    std::string finalResponseBody;
 
-    BOOL ok = WinHttpSendRequest(
-        hRequest,
-        headersWide.c_str(),
-        (DWORD)headersWide.size(),
-        WINHTTP_NO_REQUEST_DATA,
-        0,
-        (DWORD)fileSize,
-        0
-    );
+    for (uint64_t chunkIdx = 0; chunkIdx < totalChunks; ++chunkIdx) {
+        uint64_t chunkOffset = chunkIdx * kMaxChunkBytes;
+        uint64_t chunkSize = std::min<uint64_t>(kMaxChunkBytes, fileSize - chunkOffset);
 
-    std::vector<char> chunk(256 * 1024);
-    while (ok && in.good()) {
-        in.read(chunk.data(), chunk.size());
-        std::streamsize n = in.gcount();
-        if (n <= 0) break;
-        DWORD written = 0;
-        ok = WinHttpWriteData(hRequest, chunk.data(), (DWORD)n, &written);
-    }
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", urlPath,
+                                                nullptr, WINHTTP_NO_REFERER,
+                                                WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
 
-    if (ok) {
-        ok = WinHttpReceiveResponse(hRequest, nullptr);
-    }
+        std::string headersUtf8 = "Content-Type: video/mp4\r\n"
+                                  "Authorization: Bearer " + SanitizeHeaderVal(bearerToken) + "\r\n"
+                                  "X-Filename: " + SanitizeHeaderVal(filename) + "\r\n"
+                                  "X-Username: " + SanitizeHeaderVal(username) + "\r\n"
+                                  "X-User-Token: " + SanitizeHeaderVal(userToken) + "\r\n"
+                                  "X-App-Name: " + SanitizeHeaderVal(appName) + "\r\n";
+        if (totalChunks > 1) {
+            headersUtf8 += "X-Upload-Id: " + uploadId + "\r\n"
+                           "X-Chunk-Index: " + std::to_string(chunkIdx) + "\r\n"
+                           "X-Total-Chunks: " + std::to_string(totalChunks) + "\r\n";
+        }
+        std::wstring headersWide = ToWide(headersUtf8);
 
-    DWORD statusCode = 0;
-    DWORD statusSize = sizeof(statusCode);
-    if (ok) {
-        WinHttpQueryHeaders(hRequest,
-                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX,
-                            &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
-    }
+        BOOL ok = WinHttpSendRequest(
+            hRequest,
+            headersWide.c_str(),
+            (DWORD)headersWide.size(),
+            WINHTTP_NO_REQUEST_DATA,
+            0,
+            (DWORD)chunkSize,
+            0
+        );
 
-    std::string responseBody;
-    if (ok) {
-        DWORD avail = 0;
-        while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
-            std::vector<char> buf(avail);
-            DWORD read = 0;
-            if (WinHttpReadData(hRequest, buf.data(), avail, &read)) {
-                responseBody.append(buf.data(), read);
+        uint64_t remaining = chunkSize;
+        while (ok && remaining > 0 && in.good()) {
+            std::streamsize toRead = static_cast<std::streamsize>(std::min<uint64_t>(ioBuf.size(), remaining));
+            in.read(ioBuf.data(), toRead);
+            std::streamsize n = in.gcount();
+            if (n <= 0) {
+                ok = FALSE;
+                break;
+            }
+            DWORD written = 0;
+            ok = WinHttpWriteData(hRequest, ioBuf.data(), (DWORD)n, &written);
+            remaining -= static_cast<uint64_t>(n);
+        }
+
+        if (ok) {
+            ok = WinHttpReceiveResponse(hRequest, nullptr);
+        }
+
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        if (ok) {
+            WinHttpQueryHeaders(hRequest,
+                                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX,
+                                &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+        }
+
+        std::string responseBody;
+        if (ok) {
+            DWORD avail = 0;
+            while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+                std::vector<char> buf(avail);
+                DWORD read = 0;
+                if (WinHttpReadData(hRequest, buf.data(), avail, &read)) {
+                    responseBody.append(buf.data(), read);
+                }
             }
         }
+
+        WinHttpCloseHandle(hRequest);
+
+        if (!ok || (statusCode != 200 && statusCode != 201)) {
+            LOG_ERROR("Uploader: HTTP POST failed on chunk %llu/%llu (status %lu, body: %s)",
+                      (unsigned long long)(chunkIdx + 1), (unsigned long long)totalChunks,
+                      (unsigned long)statusCode, responseBody.c_str());
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
+
+        finalResponseBody = std::move(responseBody);
     }
 
-    WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
-    if (!ok || (statusCode != 200 && statusCode != 201)) {
-        LOG_ERROR("Uploader: HTTP POST failed (status %lu, body: %s)",
-                  (unsigned long)statusCode, responseBody.c_str());
-        return false;
-    }
-
-    outShareUrl = ExtractJsonField(responseBody, "url");
+    outShareUrl = ExtractJsonField(finalResponseBody, "url");
     if (outShareUrl.empty()) {
-        LOG_ERROR("Uploader: missing 'url' in server response: %s", responseBody.c_str());
+        LOG_ERROR("Uploader: missing 'url' in server response: %s", finalResponseBody.c_str());
         return false;
     }
 

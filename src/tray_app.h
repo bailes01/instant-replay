@@ -29,7 +29,14 @@ public:
 
     void TriggerSaveReplay();
     void UploadLatestClip();
+    void CopyMostRecentUploadLink();
     void SwitchMonitor(int monitorIndex);
+    void ChangeFps(int fps);
+    void PromptCustomFps();
+    void ChangeReplaySeconds(int seconds);
+    void PromptCustomReplaySeconds();
+    void PromptChangeOutputDir();
+    void PromptChangeUploadToken();
     void ToggleBitrateSweep();
     void StartHotkeyRebind();
     void PromptChangeUsername();
@@ -56,6 +63,7 @@ private:
 
     HINSTANCE m_hInstance = nullptr;
     HWND m_hwnd = nullptr;
+    HWND m_osdHwnd = nullptr;
     HHOOK m_kbHook = nullptr;
     bool m_hotkeyRegistered = false;
     std::atomic<bool> m_rebindingHotkey{false};
@@ -77,5 +85,6 @@ private:
     std::string m_lastSavedPath;
     std::string m_lastSavedAppName = "Desktop";
     std::string m_lastActiveAppName = "Desktop";
+    std::string m_lastShareUrl;
     int m_autoSaveTestSeconds = 0;
 };
