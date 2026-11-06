@@ -113,6 +113,15 @@ enum MenuIds {
     IDM_REPLAY_300 = 1035,
     IDM_REPLAY_CUSTOM = 1036,
     IDM_UPDATE_APP = 1040,
+    IDM_CODEC_AV1 = 1050,
+    IDM_CODEC_HEVC = 1051,
+    IDM_CODEC_H264 = 1052,
+    IDM_BITRATE_8M = 1060,
+    IDM_BITRATE_10M = 1061,
+    IDM_BITRATE_16M = 1062,
+    IDM_BITRATE_24M = 1063,
+    IDM_BITRATE_32M = 1064,
+    IDM_BITRATE_CUSTOM = 1065,
     IDM_EXIT = 1099,
     IDM_MONITOR_BASE = 1100
 };
@@ -570,6 +579,38 @@ void TrayApp::PromptCustomReplaySeconds() {
             ChangeReplaySeconds(val);
         } catch (...) {
             ShowBalloon("Invalid Replay Length", "Please enter a number between 3 and 600.");
+        }
+    }
+}
+
+void TrayApp::ChangeCodec(VideoCodec codec) {
+    if (codec == m_config.codec) return;
+    m_config.codec = codec;
+    m_config.Save(m_configPath);
+    StartPipeline();
+    const char* name = (codec == VideoCodec::AV1) ? "AV1" : (codec == VideoCodec::HEVC ? "HEVC (H.265)" : "H.264 (Best for Discord)");
+    ShowBalloon("Video Codec Changed", std::string("Now encoding with ") + name);
+}
+
+void TrayApp::ChangeBitrate(int kbps) {
+    kbps = std::clamp(kbps, 1000, 100000);
+    if (kbps == m_config.bitrate_kbps) return;
+    m_config.bitrate_kbps = kbps;
+    m_config.Save(m_configPath);
+    StartPipeline();
+    ShowBalloon("Bitrate Updated", "Video bitrate set to " + std::to_string(m_config.bitrate_kbps / 1000) + " Mbps");
+}
+
+void TrayApp::PromptCustomBitrate() {
+    std::string raw;
+    if (PromptTextDialog(m_hInstance, L"InstantReplay - Custom Bitrate",
+                         L"Target bitrate in kbps (e.g. 10000 = 10 Mbps):",
+                         std::to_string(m_config.bitrate_kbps), raw)) {
+        try {
+            int val = std::stoi(raw);
+            ChangeBitrate(val);
+        } catch (...) {
+            ShowBalloon("Invalid Bitrate", "Please enter a number between 1000 and 100000 kbps.");
         }
     }
 }
@@ -1215,44 +1256,36 @@ void TrayApp::ShowBalloon(const std::string& title, const std::string& message) 
 
 void TrayApp::ShowContextMenu() {
     HMENU hMenu = CreatePopupMenu();
+
+    // 1. Primary Quick Actions (Top-level, easy to scan)
     std::wstring saveLabel = L"Save Last " + std::to_wstring(m_config.replay_seconds) +
-                             L"s (" + ToWideStr(m_config.hotkey_string) + L")";
+                             L"s   (" + ToWideStr(m_config.hotkey_string) + L")";
     AppendMenuW(hMenu, MF_STRING, IDM_SAVE_NOW, saveLabel.c_str());
-    AppendMenuW(hMenu, MF_STRING | (m_lastSavedPath.empty() ? MF_GRAYED : 0),
-                IDM_UPLOAD_LAST, L"Upload Last Saved Clip && Copy Link");
+    SetMenuDefaultItem(hMenu, IDM_SAVE_NOW, FALSE);
+
     AppendMenuW(hMenu, MF_STRING | (m_lastShareUrl.empty() ? MF_GRAYED : 0),
-                IDM_COPY_LAST_LINK, L"Copy Link for Most Recent Upload");
-    std::wstring galleryLabel = L"Open My Clip Gallery (" + ToWideStr(m_config.username) + L")";
+                IDM_COPY_LAST_LINK, L"Copy Recent Share Link");
+    AppendMenuW(hMenu, MF_STRING | (m_lastSavedPath.empty() ? MF_GRAYED : 0),
+                IDM_UPLOAD_LAST, L"Upload Last Saved Clip");
+
+    std::wstring galleryLabel = L"Open My Clip Gallery (@" + ToWideStr(m_config.username) + L")";
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GALLERY, galleryLabel.c_str());
+    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_FOLDER, L"Open Captures Folder");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
-    // Monitor submenu
+    // 2. Folder: Recording & Quality ->
+    HMENU hRecFolder = CreatePopupMenu();
+
+    //   2a. Monitor submenu
     HMENU hMonMenu = CreatePopupMenu();
     for (const auto& m : m_capture.GetMonitors()) {
         UINT flags = MF_STRING | (m.index == m_capture.GetActiveMonitorIndex() ? MF_CHECKED : 0);
         AppendMenuW(hMonMenu, flags, IDM_MONITOR_BASE + m.index, ToWideStr(m.name).c_str());
     }
-    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hMonMenu), L"Select Monitor");
+    std::wstring monRootLbl = L"Monitor (Display " + std::to_wstring(m_capture.GetActiveMonitorIndex() + 1) + L")";
+    AppendMenuW(hRecFolder, MF_POPUP, reinterpret_cast<UINT_PTR>(hMonMenu), monRootLbl.c_str());
 
-    // FPS submenu
-    HMENU hFpsMenu = CreatePopupMenu();
-    const int fpsPresets[] = {30, 60, 90, 120, 144};
-    const int fpsIds[]     = {IDM_FPS_30, IDM_FPS_60, IDM_FPS_90, IDM_FPS_120, IDM_FPS_144};
-    bool fpsMatched = false;
-    for (size_t i = 0; i < 5; ++i) {
-        bool checked = (m_config.fps == fpsPresets[i]);
-        if (checked) fpsMatched = true;
-        std::wstring lbl = std::to_wstring(fpsPresets[i]) + L" FPS";
-        AppendMenuW(hFpsMenu, MF_STRING | (checked ? MF_CHECKED : 0), fpsIds[i], lbl.c_str());
-    }
-    std::wstring customFpsLbl = fpsMatched
-        ? L"Custom..."
-        : (L"Custom (" + std::to_wstring(m_config.fps) + L" FPS)...");
-    AppendMenuW(hFpsMenu, MF_STRING | (!fpsMatched ? MF_CHECKED : 0), IDM_FPS_CUSTOM, customFpsLbl.c_str());
-    std::wstring fpsRootLbl = L"Frame Rate (" + std::to_wstring(m_config.fps) + L" FPS)";
-    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hFpsMenu), fpsRootLbl.c_str());
-
-    // Replay Seconds submenu
+    //   2b. Replay Length submenu
     HMENU hRepMenu = CreatePopupMenu();
     const int repPresets[] = {15, 30, 45, 60, 120, 300};
     const int repIds[]     = {IDM_REPLAY_15, IDM_REPLAY_30, IDM_REPLAY_45, IDM_REPLAY_60, IDM_REPLAY_120, IDM_REPLAY_300};
@@ -1268,49 +1301,107 @@ void TrayApp::ShowContextMenu() {
         : (L"Custom (" + std::to_wstring(m_config.replay_seconds) + L"s)...");
     AppendMenuW(hRepMenu, MF_STRING | (!repMatched ? MF_CHECKED : 0), IDM_REPLAY_CUSTOM, customRepLbl.c_str());
     std::wstring repRootLbl = L"Replay Length (" + std::to_wstring(m_config.replay_seconds) + L"s)";
-    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hRepMenu), repRootLbl.c_str());
+    AppendMenuW(hRecFolder, MF_POPUP, reinterpret_cast<UINT_PTR>(hRepMenu), repRootLbl.c_str());
 
-    // Audio mode submenu
+    //   2c. Frame Rate (FPS) submenu
+    HMENU hFpsMenu = CreatePopupMenu();
+    const int fpsPresets[] = {30, 60, 90, 120, 144};
+    const int fpsIds[]     = {IDM_FPS_30, IDM_FPS_60, IDM_FPS_90, IDM_FPS_120, IDM_FPS_144};
+    bool fpsMatched = false;
+    for (size_t i = 0; i < 5; ++i) {
+        bool checked = (m_config.fps == fpsPresets[i]);
+        if (checked) fpsMatched = true;
+        std::wstring lbl = std::to_wstring(fpsPresets[i]) + L" FPS";
+        AppendMenuW(hFpsMenu, MF_STRING | (checked ? MF_CHECKED : 0), fpsIds[i], lbl.c_str());
+    }
+    std::wstring customFpsLbl = fpsMatched
+        ? L"Custom..."
+        : (L"Custom (" + std::to_wstring(m_config.fps) + L" FPS)...");
+    AppendMenuW(hFpsMenu, MF_STRING | (!fpsMatched ? MF_CHECKED : 0), IDM_FPS_CUSTOM, customFpsLbl.c_str());
+    std::wstring fpsRootLbl = L"Frame Rate (" + std::to_wstring(m_config.fps) + L" FPS)";
+    AppendMenuW(hRecFolder, MF_POPUP, reinterpret_cast<UINT_PTR>(hFpsMenu), fpsRootLbl.c_str());
+
+    //   2d. Video Codec submenu
+    HMENU hCodecMenu = CreatePopupMenu();
+    AppendMenuW(hCodecMenu, MF_STRING | (m_config.codec == VideoCodec::H264 ? MF_CHECKED : 0),
+                IDM_CODEC_H264, L"H.264 / AVC (Best for Discord Embeds)");
+    AppendMenuW(hCodecMenu, MF_STRING | (m_config.codec == VideoCodec::HEVC ? MF_CHECKED : 0),
+                IDM_CODEC_HEVC, L"HEVC / H.265");
+    AppendMenuW(hCodecMenu, MF_STRING | (m_config.codec == VideoCodec::AV1 ? MF_CHECKED : 0),
+                IDM_CODEC_AV1, L"AV1 (Smallest File Size, RTX 40/50)");
+    const wchar_t* codecShort = (m_config.codec == VideoCodec::AV1) ? L"AV1" : (m_config.codec == VideoCodec::HEVC ? L"HEVC" : L"H.264");
+    std::wstring codecRootLbl = std::wstring(L"Video Codec (") + codecShort + L")";
+    AppendMenuW(hRecFolder, MF_POPUP, reinterpret_cast<UINT_PTR>(hCodecMenu), codecRootLbl.c_str());
+
+    //   2e. Bitrate submenu
+    HMENU hBitrateMenu = CreatePopupMenu();
+    const int brPresets[] = {8000, 10000, 16000, 24000, 32000};
+    const int brIds[]     = {IDM_BITRATE_8M, IDM_BITRATE_10M, IDM_BITRATE_16M, IDM_BITRATE_24M, IDM_BITRATE_32M};
+    bool brMatched = false;
+    for (size_t i = 0; i < 5; ++i) {
+        bool checked = (m_config.bitrate_kbps == brPresets[i]);
+        if (checked) brMatched = true;
+        std::wstring lbl = std::to_wstring(brPresets[i] / 1000) + L" Mbps";
+        AppendMenuW(hBitrateMenu, MF_STRING | (checked ? MF_CHECKED : 0), brIds[i], lbl.c_str());
+    }
+    std::wstring customBrLbl = brMatched
+        ? L"Custom..."
+        : (L"Custom (" + std::to_wstring(m_config.bitrate_kbps) + L" kbps)...");
+    AppendMenuW(hBitrateMenu, MF_STRING | (!brMatched ? MF_CHECKED : 0), IDM_BITRATE_CUSTOM, customBrLbl.c_str());
+    std::wstring brRootLbl = L"Video Bitrate (" + std::to_wstring(m_config.bitrate_kbps / 1000) + L" Mbps)";
+    AppendMenuW(hRecFolder, MF_POPUP, reinterpret_cast<UINT_PTR>(hBitrateMenu), brRootLbl.c_str());
+
+    //   2f. Audio Source submenu
     HMENU hAudMenu = CreatePopupMenu();
     AppendMenuW(hAudMenu, MF_STRING | (m_config.audio_mode == AudioMode::ActiveWindow ? MF_CHECKED : 0),
-                IDM_AUDIO_ACTIVE, L"Active Window Only (Process Loopback)");
+                IDM_AUDIO_ACTIVE, L"Active Game / Window Only");
     AppendMenuW(hAudMenu, MF_STRING | (m_config.audio_mode == AudioMode::Desktop ? MF_CHECKED : 0),
                 IDM_AUDIO_DESKTOP, L"Full Desktop Audio");
     AppendMenuW(hAudMenu, MF_STRING | (m_config.audio_mode == AudioMode::Off ? MF_CHECKED : 0),
                 IDM_AUDIO_OFF, L"Muted / No Audio");
-    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hAudMenu), L"Audio Source");
+    AppendMenuW(hRecFolder, MF_POPUP, reinterpret_cast<UINT_PTR>(hAudMenu), L"Audio Source");
 
-    std::wstring rebindLabel = L"Change Save Hotkey... (Current: " + ToWideStr(m_config.hotkey_string) + L")";
-    AppendMenuW(hMenu, MF_STRING, IDM_REBIND_HOTKEY, rebindLabel.c_str());
-
+    AppendMenuW(hRecFolder, MF_SEPARATOR, 0, nullptr);
+    std::wstring rebindLabel = L"Change Save Hotkey... (" + ToWideStr(m_config.hotkey_string) + L")";
+    AppendMenuW(hRecFolder, MF_STRING, IDM_REBIND_HOTKEY, rebindLabel.c_str());
     std::wstring outDirLabel = L"Set Output Folder... (" + ToWideStr(m_config.output_dir) + L")";
-    AppendMenuW(hMenu, MF_STRING, IDM_SET_OUTPUT_DIR, outDirLabel.c_str());
+    AppendMenuW(hRecFolder, MF_STRING, IDM_SET_OUTPUT_DIR, outDirLabel.c_str());
 
-    std::wstring userLabel = L"Set Username... (Current: " + ToWideStr(m_config.username) + L")";
-    AppendMenuW(hMenu, MF_STRING, IDM_CHANGE_USERNAME, userLabel.c_str());
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hRecFolder), L"Recording && Quality");
 
+    // 3. Folder: Upload & Account ->
+    HMENU hUploadFolder = CreatePopupMenu();
+    AppendMenuW(hUploadFolder, MF_STRING | (m_config.auto_upload ? MF_CHECKED : 0),
+                IDM_TOGGLE_AUTOUPLOAD, L"Auto-Upload Clip on Save");
+    AppendMenuW(hUploadFolder, MF_STRING | (m_config.delete_after_upload ? MF_CHECKED : 0),
+                IDM_TOGGLE_DELETE_ON_UPLOAD, L"Delete Local Video After Upload");
+    AppendMenuW(hUploadFolder, MF_SEPARATOR, 0, nullptr);
+
+    std::wstring userLabel = L"Set Username... (@" + ToWideStr(m_config.username) + L")";
+    AppendMenuW(hUploadFolder, MF_STRING, IDM_CHANGE_USERNAME, userLabel.c_str());
     std::wstring urlStatus = m_config.server_url.empty() ? L"Not Set" : ToWideStr(m_config.server_url);
     std::wstring urlLabel = L"Set Server URL... (" + urlStatus + L")";
-    AppendMenuW(hMenu, MF_STRING, IDM_SET_SERVER_URL, urlLabel.c_str());
-
+    AppendMenuW(hUploadFolder, MF_STRING, IDM_SET_SERVER_URL, urlLabel.c_str());
     std::wstring tokenStatus = m_config.upload_token.empty() ? L"Not Set" : L"Configured";
     std::wstring tokenLabel = L"Set Upload Token... (" + tokenStatus + L")";
-    AppendMenuW(hMenu, MF_STRING, IDM_SET_UPLOAD_TOKEN, tokenLabel.c_str());
+    AppendMenuW(hUploadFolder, MF_STRING, IDM_SET_UPLOAD_TOKEN, tokenLabel.c_str());
 
-    AppendMenuW(hMenu, MF_STRING | (m_config.auto_upload ? MF_CHECKED : 0),
-                IDM_TOGGLE_AUTOUPLOAD, L"Auto-Upload on Save");
-    AppendMenuW(hMenu, MF_STRING | (m_config.delete_after_upload ? MF_CHECKED : 0),
-                IDM_TOGGLE_DELETE_ON_UPLOAD, L"Delete Local Video After Upload");
-    AppendMenuW(hMenu, MF_STRING | (m_config.debug_bitrate_sweep ? MF_CHECKED : 0),
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hUploadFolder), L"Upload && Account");
+
+    // 4. Folder: System & Updates ->
+    HMENU hSysFolder = CreatePopupMenu();
+    AppendMenuW(hSysFolder, MF_STRING | (IsStartWithWindowsEnabled() ? MF_CHECKED : 0),
+                IDM_TOGGLE_AUTORUN, L"Start with Windows");
+    AppendMenuW(hSysFolder, MF_STRING, IDM_UPDATE_APP, L"Check for Updates (GitHub Release)");
+    AppendMenuW(hSysFolder, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hSysFolder, MF_STRING, IDM_EDIT_CONFIG, L"Edit config.ini in Notepad");
+    AppendMenuW(hSysFolder, MF_STRING, IDM_RELOAD_CONFIG, L"Reload config.ini");
+    AppendMenuW(hSysFolder, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hSysFolder, MF_STRING | (m_config.debug_bitrate_sweep ? MF_CHECKED : 0),
                 IDM_TOGGLE_SWEEP, L"Debug: Bitrate Sweep Mode");
-    AppendMenuW(hMenu, MF_STRING | (IsStartWithWindowsEnabled() ? MF_CHECKED : 0),
-                IDM_TOGGLE_AUTORUN, L"Start with Windows (Always Recording)");
 
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_FOLDER, L"Open Captures Folder");
-    AppendMenuW(hMenu, MF_STRING, IDM_EDIT_CONFIG, L"Edit config.ini");
-    AppendMenuW(hMenu, MF_STRING, IDM_RELOAD_CONFIG, L"Reload config.ini");
-    AppendMenuW(hMenu, MF_STRING, IDM_UPDATE_APP, L"Check for Updates (GitHub Release)");
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hSysFolder), L"System && Updates");
+
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -1409,6 +1500,15 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             else if (id == IDM_REPLAY_120) app->ChangeReplaySeconds(120);
             else if (id == IDM_REPLAY_300) app->ChangeReplaySeconds(300);
             else if (id == IDM_REPLAY_CUSTOM) app->PromptCustomReplaySeconds();
+            else if (id == IDM_CODEC_AV1) app->ChangeCodec(VideoCodec::AV1);
+            else if (id == IDM_CODEC_HEVC) app->ChangeCodec(VideoCodec::HEVC);
+            else if (id == IDM_CODEC_H264) app->ChangeCodec(VideoCodec::H264);
+            else if (id == IDM_BITRATE_8M) app->ChangeBitrate(8000);
+            else if (id == IDM_BITRATE_10M) app->ChangeBitrate(10000);
+            else if (id == IDM_BITRATE_16M) app->ChangeBitrate(16000);
+            else if (id == IDM_BITRATE_24M) app->ChangeBitrate(24000);
+            else if (id == IDM_BITRATE_32M) app->ChangeBitrate(32000);
+            else if (id == IDM_BITRATE_CUSTOM) app->PromptCustomBitrate();
             else if (id == IDM_OPEN_FOLDER) {
                 ShellExecuteW(nullptr, L"open", ToWideStr(app->m_config.output_dir).c_str(),
                               nullptr, nullptr, SW_SHOWNORMAL);

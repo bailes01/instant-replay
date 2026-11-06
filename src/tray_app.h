@@ -35,6 +35,9 @@ public:
     void PromptCustomFps();
     void ChangeReplaySeconds(int seconds);
     void PromptCustomReplaySeconds();
+    void ChangeCodec(VideoCodec codec);
+    void ChangeBitrate(int kbps);
+    void PromptCustomBitrate();
     void PromptChangeOutputDir();
     void PromptChangeServerUrl();
     void PromptChangeUploadToken();
