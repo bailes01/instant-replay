@@ -232,3 +232,128 @@ bool Uploader::CopyToClipboard(const std::string& text) {
     CloseClipboard();
     return true;
 }
+
+static bool HttpGetToBufferOrFile(const std::string& url, const std::string& destFilePath, std::string& outBody) {
+    std::wstring wUrl = ToWide(url);
+    URL_COMPONENTS urlComp{};
+    urlComp.dwStructSize = sizeof(urlComp);
+    wchar_t hostName[256]{};
+    wchar_t urlPath[2048]{};
+    urlComp.lpszHostName = hostName;
+    urlComp.dwHostNameLength = 256;
+    urlComp.lpszUrlPath = urlPath;
+    urlComp.dwUrlPathLength = 2048;
+
+    if (!WinHttpCrackUrl(wUrl.c_str(), (DWORD)wUrl.size(), 0, &urlComp)) {
+        return false;
+    }
+
+    HINTERNET hSession = WinHttpOpen(L"InstantReplay-Updater/1.0",
+                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME,
+                                     WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 15000, 15000, 60000, 120000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD reqFlags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath,
+                                            nullptr, WINHTTP_NO_REFERER,
+                                            WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    BOOL ok = WinHttpSendRequest(hRequest,
+                                 L"User-Agent: InstantReplay-Updater/1.0\r\nAccept: */*\r\n",
+                                 -1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (ok) {
+        ok = WinHttpReceiveResponse(hRequest, nullptr);
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (ok) {
+        WinHttpQueryHeaders(hRequest,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX,
+                            &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    }
+
+    if (!ok || statusCode != 200) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    std::ofstream outFile;
+    if (!destFilePath.empty()) {
+        outFile.open(destFilePath, std::ios::binary | std::ios::trunc);
+        if (!outFile.is_open()) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
+    }
+
+    uint64_t totalBytes = 0;
+    DWORD avail = 0;
+    while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+        std::vector<char> buf(avail);
+        DWORD read = 0;
+        if (!WinHttpReadData(hRequest, buf.data(), avail, &read)) {
+            ok = FALSE;
+            break;
+        }
+        if (read > 0) {
+            if (!destFilePath.empty()) {
+                outFile.write(buf.data(), read);
+            } else {
+                outBody.append(buf.data(), read);
+            }
+            totalBytes += read;
+        }
+    }
+
+    if (!destFilePath.empty()) {
+        outFile.close();
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    if (!destFilePath.empty() && totalBytes < 50000) {
+        std::error_code ec;
+        std::filesystem::remove(destFilePath, ec);
+        return false;
+    }
+    return ok == TRUE;
+}
+
+bool Uploader::DownloadLatestReleaseExe(const std::string& destPath, std::string& outTag) {
+    outTag = "latest";
+    std::string apiJson;
+    if (HttpGetToBufferOrFile("https://api.github.com/repos/bailes01/instant-replay/releases/latest", "", apiJson)) {
+        std::string tag = ExtractJsonField(apiJson, "tag_name");
+        if (!tag.empty()) outTag = tag;
+    }
+
+    const std::string directUrl = "https://github.com/bailes01/instant-replay/releases/latest/download/InstantReplay.exe";
+    std::string dummy;
+    if (!HttpGetToBufferOrFile(directUrl, destPath, dummy)) {
+        LOG_ERROR("Updater: failed to download latest InstantReplay.exe from GitHub.");
+        return false;
+    }
+    LOG_INFO("Updater: downloaded InstantReplay.exe (%s) -> %s", outTag.c_str(), destPath.c_str());
+    return true;
+}

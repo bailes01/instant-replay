@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{og_title}</title>
+<meta property="og:title" content="{og_title}">
+<meta property="og:description" content="{og_desc}">
+<meta property="og:site_name" content="@{esc_user} on InstantReplay">
+<meta property="og:type" content="video.other">
+<meta property="og:url" content="{page_url}">
+<meta property="og:image" content="{thumb_url}">
+<meta property="og:video" content="{raw_url}">
+<meta property="og:video:url" content="{raw_url}">
+<meta property="og:video:secure_url" content="{raw_url}">
+<meta property="og:video:type" content="video/mp4">
+<meta property="og:video:width" content="1920">
+<meta property="og:video:height" content="1080">
+<meta name="twitter:card" content="player">
+<meta name="twitter:title" content="{og_title}">
+<meta name="twitter:description" content="{og_desc}">
+<meta name="twitter:image" content="{thumb_url}">
+<meta name="twitter:player:width" content="1920">
+<meta name="twitter:player:height" content="1080">
+<meta name="twitter:player:stream" content="{raw_url}">
+<meta name="twitter:player:stream:content_type" content="video/mp4">
+<meta name="theme-color" content="#58a6ff">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="clip-page">
+  <div class="card">
+    <video id="clipVideo" controls autoplay playsinline preload="auto" poster="/thumb/{clip_id}.jpg?v={mtime}" src="/stream/{clip_id}?v={mtime}"></video>
+    <div class="bar">
+      <div class="info">
+        <div class="title-line">
+          <span class="app-name">{esc_title}</span>
+          {vis_pill}
+        </div>
+        <span class="date-line">{esc_date} &middot; Recorded in {esc_app}</span>
+      </div>
+      <div class="actions">
+        <div class="rating-box" id="ratingBox">
+          <div class="star-slider" id="starSlider" title="Drag or click to rate from 0.5 to 5.0 in 0.5 steps">
+            <span class="stars-bg">&#9733;&#9733;&#9733;&#9733;&#9733;</span>
+            <span class="stars-fg" id="starFg" style="width:{rating_pct}%">&#9733;&#9733;&#9733;&#9733;&#9733;</span>
+          </div>
+          <div class="rating-readout">
+            <span class="rating-avg-lbl" id="ratingAvgLabel">{rating_summary_txt}</span>
+            <span class="rating-my-lbl" id="ratingMyLabel">{my_rating_txt}</span>
+          </div>
+        </div>
+        {edit_toggle_btn}
+        <a class="badge" href="/u/{esc_user}">@{esc_user}'s Gallery</a>
+        <a class="dl" href="/f/{clip_id}.mp4?v={mtime}" download>Download</a>
+      </div>
+    </div>
+    {editor_html}
+  </div>
+  <script>
+  (() => {{
+    const slider = document.getElementById('starSlider');
+    const starFg = document.getElementById('starFg');
+    const avgLbl = document.getElementById('ratingAvgLabel');
+    const myLbl = document.getElementById('ratingMyLabel');
+    let savedAvgPct = {rating_pct};
+    let isDraggingStar = false;
+
+    function calcStars(clientX) {{
+      const rect = slider.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      return Math.max(0.5, Math.round(ratio * 10) / 2);
+    }}
+
+    function previewStars(val) {{
+      starFg.style.width = ((val / 5.0) * 100).toFixed(1) + '%';
+      myLbl.textContent = 'Rate: ' + val.toFixed(1) + '/5';
+    }}
+
+    async function submitRating(val) {{
+      myLbl.textContent = 'Saving ' + val.toFixed(1) + '/5...';
+      try {{
+        const resp = await fetch('/api/clips/{clip_id}/rate', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ rating: val }})
+        }});
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Failed');
+        savedAvgPct = (data.rating_avg / 5.0) * 100;
+        starFg.style.width = savedAvgPct.toFixed(1) + '%';
+        avgLbl.textContent = data.rating_avg.toFixed(2) + '/5 (' + data.rating_count + (data.rating_count === 1 ? ' rating)' : ' ratings)');
+        myLbl.textContent = 'Your rating: ' + data.my_rating.toFixed(1) + '/5';
+      }} catch (e) {{
+        myLbl.textContent = 'Rating failed';
+      }}
+    }}
+
+    slider.addEventListener('pointermove', (e) => {{
+      previewStars(calcStars(e.clientX));
+    }});
+    slider.addEventListener('pointerdown', (e) => {{
+      isDraggingStar = true;
+      slider.setPointerCapture(e.pointerId);
+      previewStars(calcStars(e.clientX));
+    }});
+    slider.addEventListener('pointerup', (e) => {{
+      if (!isDraggingStar) return;
+      isDraggingStar = false;
+      submitRating(calcStars(e.clientX));
+    }});
+    slider.addEventListener('pointerleave', () => {{
+      if (!isDraggingStar) {{
+        starFg.style.width = savedAvgPct.toFixed(1) + '%';
+      }}
+    }});
+  }})();
+  </script>
+</body>
+</html>

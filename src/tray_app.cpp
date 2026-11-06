@@ -112,6 +112,7 @@ enum MenuIds {
     IDM_REPLAY_120 = 1034,
     IDM_REPLAY_300 = 1035,
     IDM_REPLAY_CUSTOM = 1036,
+    IDM_UPDATE_APP = 1040,
     IDM_EXIT = 1099,
     IDM_MONITOR_BASE = 1100
 };
@@ -632,12 +633,96 @@ void TrayApp::OpenUserGallery() {
     ShellExecuteW(nullptr, L"open", ToWideStr(galleryUrl).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+void TrayApp::CheckAndApplyUpdate() {
+    ShowBalloon("Checking for Updates...", "Downloading latest InstantReplay.exe from GitHub Releases...");
+    std::thread([this]() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        wchar_t exePathW[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, exePathW, MAX_PATH) == 0) {
+            ShowBalloon("Update Failed", "Could not determine current executable path.");
+            return;
+        }
+        std::filesystem::path curExe(exePathW);
+        std::filesystem::path dir = curExe.parent_path();
+        std::filesystem::path newExe = dir / "InstantReplay.new.exe";
+        std::filesystem::path oldExe = dir / "InstantReplay.old.exe";
+
+        std::string releaseTag;
+        if (!Uploader::DownloadLatestReleaseExe(WideToUtf8(newExe.wstring()), releaseTag)) {
+            ShowBalloon("Update Failed", "Could not download latest release from GitHub.");
+            return;
+        }
+
+        // Windows allows renaming a currently running .exe on disk
+        std::error_code ec;
+        std::filesystem::remove(oldExe, ec);
+        std::filesystem::rename(curExe, oldExe, ec);
+        if (!ec) {
+            std::filesystem::rename(newExe, curExe, ec);
+            if (!ec) {
+                ShowBalloon("Update Installed (" + releaseTag + ")", "Restarting InstantReplay...");
+                Sleep(900);
+                STARTUPINFOW si{};
+                si.cb = sizeof(si);
+                PROCESS_INFORMATION pi{};
+                std::wstring cmd = L"\"" + curExe.wstring() + L"\" --restarted";
+                std::wstring workDir = dir.wstring();
+                if (CreateProcessW(curExe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0,
+                                   nullptr, workDir.c_str(), &si, &pi)) {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+                if (m_hwnd) {
+                    PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
+                }
+                return;
+            } else {
+                // Rollback if moving newExe failed
+                std::filesystem::rename(oldExe, curExe, ec);
+            }
+        }
+
+        // Fallback if filesystem prevented renaming the running .exe: spawn a tiny cmd swapper
+        std::filesystem::path batPath = dir / "update_swap.bat";
+        {
+            FILE* f = nullptr;
+            _wfopen_s(&f, batPath.c_str(), L"w");
+            if (f) {
+                fprintf(f, "@echo off\n"
+                           "timeout /t 2 /nobreak >nul\n"
+                           "move /y \"%s\" \"%s\" >nul\n"
+                           "start \"\" \"%s\"\n"
+                           "del \"%%~f0\"\n",
+                        WideToUtf8(newExe.wstring()).c_str(),
+                        WideToUtf8(curExe.wstring()).c_str(),
+                        WideToUtf8(curExe.wstring()).c_str());
+                fclose(f);
+            }
+        }
+        ShowBalloon("Applying Update (" + releaseTag + ")", "Closing to replace executable...");
+        Sleep(800);
+        ShellExecuteW(nullptr, L"open", batPath.c_str(), nullptr, dir.c_str(), SW_HIDE);
+        if (m_hwnd) {
+            PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
+        }
+    }).detach();
+}
+
 bool TrayApp::Init(HINSTANCE hInstance, const std::string& configPath, int autoSaveTestSeconds) {
     g_trayAppInstance = this;
     m_hInstance = hInstance;
     m_configPath = configPath;
     m_autoSaveTestSeconds = autoSaveTestSeconds;
     m_config = Config::Load(m_configPath);
+
+    // Clean up any leftover .old.exe from a previous self-update
+    {
+        wchar_t exePathW[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, exePathW, MAX_PATH) > 0) {
+            std::error_code cleanEc;
+            std::filesystem::remove(std::filesystem::path(exePathW).parent_path() / "InstantReplay.old.exe", cleanEc);
+        }
+    }
 
     std::error_code ec;
     std::filesystem::create_directories(m_config.output_dir, ec);
@@ -1225,6 +1310,7 @@ void TrayApp::ShowContextMenu() {
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_FOLDER, L"Open Captures Folder");
     AppendMenuW(hMenu, MF_STRING, IDM_EDIT_CONFIG, L"Edit config.ini");
     AppendMenuW(hMenu, MF_STRING, IDM_RELOAD_CONFIG, L"Reload config.ini");
+    AppendMenuW(hMenu, MF_STRING, IDM_UPDATE_APP, L"Check for Updates (GitHub Release)");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -1332,6 +1418,7 @@ LRESULT CALLBACK TrayApp::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                               ToWideStr(app->m_configPath).c_str(), nullptr, SW_SHOWNORMAL);
             }
             else if (id == IDM_RELOAD_CONFIG) app->ReloadConfig();
+            else if (id == IDM_UPDATE_APP) app->CheckAndApplyUpdate();
             else if (id == IDM_TOGGLE_SWEEP) app->ToggleBitrateSweep();
             else if (id == IDM_TOGGLE_AUTOUPLOAD) {
                 app->m_config.auto_upload = !app->m_config.auto_upload;

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Public Clip Gallery - InstantReplay</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Public Clip Gallery</h1>
+      <div class="header-right">
+        <div class="sort-bar">
+          <a class="sort-btn {active_rating}" href="/gallery?sort=rating">Highest Rated</a>
+          <a class="sort-btn {active_lowest}" href="/gallery?sort=lowest">Lowest Rated</a>
+          <a class="sort-btn {active_most}" href="/gallery?sort=most_rated">Most Rated</a>
+          <a class="sort-btn {active_newest}" href="/gallery?sort=newest">Newest</a>
+          <a class="sort-btn {active_oldest}" href="/gallery?sort=oldest">Oldest</a>
+        </div>
+        <span class="count">{clip_count_label}</span>
+      </div>
+    </header>
+    {empty_msg}
+    {sections_html}
+  </div>
+</body>
+</html>

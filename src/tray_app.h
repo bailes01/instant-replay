@@ -42,6 +42,7 @@ public:
     void StartHotkeyRebind();
     void PromptChangeUsername();
     void OpenUserGallery();
+    void CheckAndApplyUpdate();
     void ReloadConfig();
     void ShowBalloon(const std::string& title, const std::string& message);
 

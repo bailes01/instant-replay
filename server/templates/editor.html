@@ -1,0 +1,224 @@
+    <div id="editor" class="editor-panel" style="display:none;">
+      <div class="editor-header">
+        <h3>Trim &amp; Edit Clip</h3>
+        <div class="quick-actions">
+          <button type="button" class="btn btn-secondary" id="btnLoopPreview">Loop Selection: Off</button>
+          <button type="button" class="btn btn-danger" id="btnDeleteClip">Delete Clip</button>
+        </div>
+      </div>
+
+      <!-- Draggable Dual-Handle Timeline Bar -->
+      <div class="timeline-wrap">
+        <div class="timeline-track" id="timelineTrack">
+          <div class="timeline-selection" id="timelineSelection"></div>
+          <div class="timeline-playhead" id="timelinePlayhead"></div>
+          <div class="timeline-handle left" id="handleStart" title="Drag Start Time"></div>
+          <div class="timeline-handle right" id="handleEnd" title="Drag End Time"></div>
+        </div>
+        <div class="time-inputs">
+          <label>Start (s):
+            <input type="number" id="inputStart" step="0.1" min="0" value="0.0">
+          </label>
+          <span class="duration-readout" id="trimDurationLabel">Selected: -- s</span>
+          <label>End (s):
+            <input type="number" id="inputEnd" step="0.1" min="0.1" value="0.0">
+          </label>
+        </div>
+      </div>
+
+      <!-- Save / Visibility Options -->
+      <div class="settings-row">
+        <div class="field-group">
+          <label for="inputTitle">Clip Title / Game Name</label>
+          <input type="text" id="inputTitle" value="{esc_title}" maxlength="80">
+        </div>
+        <div class="field-group">
+          <label>Visibility</label>
+          <div class="radio-group">
+            <label class="radio-opt">
+              <input type="radio" name="visMode" value="private" {priv_checked}>
+              Private (Link Only)
+            </label>
+            <label class="radio-opt">
+              <input type="radio" name="visMode" value="public" {pub_checked}>
+              Public (Show in Gallery)
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="save-actions">
+        <button type="button" class="btn btn-secondary" id="btnSaveMetaOnly">Save Title / Visibility Only</button>
+        <button type="button" class="btn btn-primary" id="btnSaveCopy">Trim &amp; Save as New Copy</button>
+        <button type="button" class="btn btn-warning" id="btnOverwrite">Trim &amp; Overwrite Original</button>
+      </div>
+      <div id="editorStatus" class="status-msg"></div>
+    </div>
+
+    <script>
+    (() => {{
+      const editorPanel = document.getElementById('editor');
+      const btnToggleEditor = document.getElementById('btnToggleEditor');
+      const video = document.getElementById('clipVideo');
+      const track = document.getElementById('timelineTrack');
+      const selBox = document.getElementById('timelineSelection');
+      const playhead = document.getElementById('timelinePlayhead');
+      const hStart = document.getElementById('handleStart');
+      const hEnd = document.getElementById('handleEnd');
+      const inStart = document.getElementById('inputStart');
+      const inEnd = document.getElementById('inputEnd');
+      const durLabel = document.getElementById('trimDurationLabel');
+      const btnLoop = document.getElementById('btnLoopPreview');
+      const inTitle = document.getElementById('inputTitle');
+      const statusEl = document.getElementById('editorStatus');
+
+      let duration = 0;
+      let startSec = 0;
+      let endSec = 0;
+      let loopPreview = false;
+      let dragging = null;
+
+      function toggleEditor(forceOpen) {{
+        const open = (typeof forceOpen === 'boolean') ? forceOpen : (editorPanel.style.display === 'none');
+        editorPanel.style.display = open ? 'flex' : 'none';
+        if (btnToggleEditor) btnToggleEditor.textContent = open ? 'Close Editor' : 'Trim / Edit';
+        if (open) syncUI();
+      }}
+      if (btnToggleEditor) {{
+        btnToggleEditor.addEventListener('click', () => toggleEditor());
+      }}
+      if (window.location.hash === '#editor') {{
+        toggleEditor(true);
+      }}
+
+      function clamp(v, lo, hi) {{ return Math.max(lo, Math.min(hi, v)); }}
+
+      function syncUI() {{
+        if (duration <= 0) return;
+        const leftPct = (startSec / duration) * 100;
+        const rightPct = (endSec / duration) * 100;
+        selBox.style.left = leftPct + '%';
+        selBox.style.width = Math.max(0, rightPct - leftPct) + '%';
+        hStart.style.left = leftPct + '%';
+        hEnd.style.left = rightPct + '%';
+        inStart.value = startSec.toFixed(1);
+        inEnd.value = endSec.toFixed(1);
+        durLabel.textContent = 'Selected: ' + Math.max(0, endSec - startSec).toFixed(1) + 's / ' + duration.toFixed(1) + 's';
+      }}
+
+      video.addEventListener('loadedmetadata', () => {{
+        duration = video.duration || 10;
+        startSec = 0;
+        endSec = duration;
+        inStart.max = duration.toFixed(1);
+        inEnd.max = duration.toFixed(1);
+        syncUI();
+      }});
+
+      video.addEventListener('timeupdate', () => {{
+        if (duration > 0) {{
+          const pct = clamp((video.currentTime / duration) * 100, 0, 100);
+          playhead.style.left = pct + '%';
+        }}
+        if (loopPreview && video.currentTime >= endSec) {{
+          video.currentTime = startSec;
+          video.play();
+        }}
+      }});
+
+      function clientXToSec(clientX) {{
+        const rect = track.getBoundingClientRect();
+        const ratio = clamp((clientX - rect.left) / rect.width, 0, 1);
+        return ratio * duration;
+      }}
+
+      hStart.addEventListener('pointerdown', (e) => {{ dragging = 'start'; hStart.setPointerCapture(e.pointerId); e.preventDefault(); }});
+      hEnd.addEventListener('pointerdown', (e) => {{ dragging = 'end'; hEnd.setPointerCapture(e.pointerId); e.preventDefault(); }});
+
+      window.addEventListener('pointermove', (e) => {{
+        if (!dragging || duration <= 0) return;
+        const t = clientXToSec(e.clientX);
+        if (dragging === 'start') {{
+          startSec = clamp(t, 0, Math.max(0, endSec - 0.2));
+          video.currentTime = startSec;
+        }} else if (dragging === 'end') {{
+          endSec = clamp(t, Math.min(duration, startSec + 0.2), duration);
+          video.currentTime = endSec;
+        }}
+        syncUI();
+      }});
+
+      window.addEventListener('pointerup', () => {{ dragging = null; }});
+
+      inStart.addEventListener('change', () => {{
+        startSec = clamp(parseFloat(inStart.value) || 0, 0, Math.max(0, endSec - 0.2));
+        video.currentTime = startSec;
+        syncUI();
+      }});
+
+      inEnd.addEventListener('change', () => {{
+        endSec = clamp(parseFloat(inEnd.value) || duration, Math.min(duration, startSec + 0.2), duration);
+        video.currentTime = endSec;
+        syncUI();
+      }});
+
+      btnLoop.addEventListener('click', () => {{
+        loopPreview = !loopPreview;
+        btnLoop.textContent = 'Loop Selection: ' + (loopPreview ? 'On' : 'Off');
+        if (loopPreview) {{
+          video.currentTime = startSec;
+          video.play();
+        }}
+      }});
+
+      function getSelectedPublic() {{
+        const r = document.querySelector('input[name="visMode"]:checked');
+        return r && r.value === 'public';
+      }}
+
+      async function submitEdit(mode) {{
+        statusEl.textContent = mode === 'meta' ? 'Saving settings...' : 'Rendering trimmed video on server...';
+        statusEl.className = 'status-msg info';
+        try {{
+          const endpoint = mode === 'meta' ? '/api/clips/{clip_id}/meta' : '/api/clips/{clip_id}/trim';
+          const resp = await fetch(endpoint, {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              start_sec: startSec,
+              end_sec: endSec,
+              mode: mode,
+              title: inTitle.value.trim(),
+              public: getSelectedPublic()
+            }})
+          }});
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Request failed');
+          if (mode === 'copy' && data.id) {{
+            statusEl.textContent = 'Saved new copy! Redirecting...';
+            window.location.href = '/v/' + data.id;
+          }} else {{
+            statusEl.textContent = 'Saved! Reloading...';
+            window.location.reload();
+          }}
+        }} catch (err) {{
+          statusEl.textContent = 'Error: ' + err.message;
+          statusEl.className = 'status-msg err';
+        }}
+      }}
+
+      document.getElementById('btnSaveMetaOnly').addEventListener('click', () => submitEdit('meta'));
+      document.getElementById('btnSaveCopy').addEventListener('click', () => submitEdit('copy'));
+      document.getElementById('btnOverwrite').addEventListener('click', () => {{
+        if (confirm('Overwrite original video clip with this trimmed range?')) {{
+          submitEdit('overwrite');
+        }}
+      }});
+
+      document.getElementById('btnDeleteClip').addEventListener('click', async () => {{
+        if (!confirm('Permanently delete this clip?')) return;
+        const resp = await fetch('/api/clips/{clip_id}', {{ method: 'DELETE' }});
+        if (resp.ok) window.location.href = '/u/{esc_user}';
+      }});
+    }})();
+    </script>

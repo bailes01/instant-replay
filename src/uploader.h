@@ -14,4 +14,7 @@ public:
     );
 
     static bool CopyToClipboard(const std::string& text);
+
+    // Self-updater via GitHub Releases (https://github.com/bailes01/instant-replay/releases/latest)
+    static bool DownloadLatestReleaseExe(const std::string& destPath, std::string& outTag);
 };

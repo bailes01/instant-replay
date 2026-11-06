@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@{esc_user}'s Clips</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="title-grp">
+        <h1>@{esc_user}</h1>
+        {owner_badge}
+      </div>
+      <div class="nav-links">
+        <div class="sort-bar">
+          <a class="sort-btn {u_act_rating}" href="/u/{esc_user}?sort=rating">Highest Rated</a>
+          <a class="sort-btn {u_act_lowest}" href="/u/{esc_user}?sort=lowest">Lowest Rated</a>
+          <a class="sort-btn {u_act_most}" href="/u/{esc_user}?sort=most_rated">Most Rated</a>
+          <a class="sort-btn {u_act_newest}" href="/u/{esc_user}?sort=newest">Newest</a>
+          <a class="sort-btn {u_act_oldest}" href="/u/{esc_user}?sort=oldest">Oldest</a>
+        </div>
+        <a href="/gallery">Public Gallery</a>
+        <span class="count">{clip_count_label}</span>
+      </div>
+    </header>
+    {empty_msg}
+    <div class="grid">{cards_html}</div>
+  </div>
+</body>
+</html>

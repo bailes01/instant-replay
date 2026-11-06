@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -152,12 +153,27 @@ def load_clip_meta(clip_id: str) -> dict | None:
     title = sanitize_app_name(meta.get("title", app_name))
     is_public = bool(meta.get("public", False))
     mtime = int(mp4_path.stat().st_mtime)
+    raw_ratings = meta.get("ratings", {})
+    ratings: dict[str, float] = {}
+    if isinstance(raw_ratings, dict):
+        for rk, rv in raw_ratings.items():
+            try:
+                val = float(rv)
+                if 0.0 <= val <= 5.0:
+                    ratings[str(rk)[:64]] = round(val, 2)
+            except (ValueError, TypeError):
+                pass
+    rating_count = len(ratings)
+    rating_avg = round(sum(ratings.values()) / rating_count, 2) if rating_count > 0 else 0.0
     return {
         "id": clip_id,
         "username": user,
         "app_name": app_name,
         "title": title,
         "public": is_public,
+        "ratings": ratings,
+        "rating_avg": rating_avg,
+        "rating_count": rating_count,
         "size": mp4_path.stat().st_size,
         "created_at": created_ts,
         "mtime": mtime,
@@ -271,6 +287,61 @@ def run_ffmpeg_trim(src_mp4: Path, dst_mp4: Path, start_sec: float, end_sec: flo
     return res2.returncode == 0 and dst_mp4.is_file() and dst_mp4.stat().st_size > 1024
 
 
+SERVER_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = SERVER_DIR / "templates"
+STATIC_DIR = SERVER_DIR / "static"
+
+
+def render_template(name: str, **kwargs) -> str:
+    tpl = (TEMPLATES_DIR / name).read_text("utf-8")
+    return tpl.format(**kwargs)
+
+
+def render_star_pill(c: dict) -> str:
+    cnt = c.get("rating_count", 0)
+    avg = c.get("rating_avg", 0.0)
+    pct = max(0.0, min(100.0, (avg / 5.0) * 100.0))
+    txt = f"{avg:.2f}/5 ({cnt})" if cnt > 0 else "No ratings"
+    return f"""<div class="rating-pill" title="{txt}">
+      <span class="stars-wrap"><span class="stars-bg">&#9733;&#9733;&#9733;&#9733;&#9733;</span><span class="stars-fg" style="width:{pct:.1f}%">&#9733;&#9733;&#9733;&#9733;&#9733;</span></span>
+      <span class="rating-txt">{txt}</span>
+    </div>"""
+
+
+def sort_clip_list(lst: list[dict], sort_mode: str) -> list[dict]:
+    if sort_mode == "lowest":
+        return sorted(
+            lst,
+            key=lambda x: (
+                0 if x.get("rating_count", 0) > 0 else 1,
+                x.get("rating_avg", 0.0),
+                -x.get("rating_count", 0),
+                -x.get("created_at", 0),
+            ),
+        )
+    if sort_mode == "most_rated":
+        return sorted(
+            lst,
+            key=lambda x: (x.get("rating_count", 0), x.get("rating_avg", 0.0), x.get("created_at", 0)),
+            reverse=True,
+        )
+    if sort_mode == "oldest":
+        return sorted(lst, key=lambda x: x.get("created_at", 0))
+    if sort_mode == "newest":
+        return sorted(lst, key=lambda x: x.get("created_at", 0), reverse=True)
+    # Default: highest / top rated
+    return sorted(
+        lst,
+        key=lambda x: (
+            1 if x.get("rating_count", 0) > 0 else 0,
+            x.get("rating_avg", 0.0),
+            x.get("rating_count", 0),
+            x.get("created_at", 0),
+        ),
+        reverse=True,
+    )
+
+
 class ClipHandler(BaseHTTPRequestHandler):
     server_version = "InstantReplayShare/2.0"
     protocol_version = "HTTP/1.1"
@@ -294,6 +365,26 @@ class ClipHandler(BaseHTTPRequestHandler):
         if key in c:
             return c[key].value
         return ""
+
+    def _get_rater_id(self) -> tuple[str, str | None]:
+        raw_cookie = self.headers.get("Cookie", "")
+        if raw_cookie:
+            c = cookies.SimpleCookie()
+            try:
+                c.load(raw_cookie)
+                # Prefer authenticated user cookie if present
+                for k, morsel in c.items():
+                    if k.startswith("ir_token_"):
+                        u = sanitize_username(k[len("ir_token_"):])
+                        if check_user_token_readonly(u, morsel.value):
+                            return f"user:{u}", None
+                if "ir_rater_id" in c and ID_RE.match(c["ir_rater_id"].value):
+                    return f"anon:{c['ir_rater_id'].value}", None
+            except Exception:
+                pass
+        new_id = secrets.token_urlsafe(9)[:12]
+        cookie_hdr = f"ir_rater_id={new_id}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"
+        return f"anon:{new_id}", cookie_hdr
 
     def _is_owner_of(self, username: str, query_token: str = "") -> bool:
         user = sanitize_username(username)
@@ -358,69 +449,144 @@ class ClipHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
 
+        if path == "/static/styles.css":
+            css_file = STATIC_DIR / "styles.css"
+            if not css_file.is_file():
+                self.send_error(404)
+                return
+            data = css_file.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/css; charset=utf-8")
+            self.send_header("Cache-Control", "public, max-age=60")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self._write_body(data)
+            return
+
         # Root or /gallery -> Public community gallery
         if path in ("/", "/gallery"):
+            sort_mode = qs.get("sort", ["rating"])[0].lower()
             clips = load_all_clips(username_filter=None, include_private=False)
-            cards_html = []
+
+            by_player: dict[str, list[dict]] = {}
             for c in clips:
-                cid = html.escape(c["id"])
-                title = html.escape(c["title"])
-                fdate = html.escape(c["formatted_date"])
-                u = html.escape(c["username"])
-                size_mb = c.get("size", 0) / (1024 * 1024)
-                cards_html.append(f"""
-                <div class="clip-card">
-                  <a class="thumb-link" href="/v/{cid}">
-                    <video muted loop playsinline preload="none" poster="/thumb/{cid}.jpg?v={c['mtime']}"
-                           data-src="/stream/{cid}?v={c['mtime']}"
-                           onmouseenter="this._ht=setTimeout(()=>{{if(!this.src)this.src=this.dataset.src;this.play().catch(()=>{{}});}},220);"
-                           onmouseleave="clearTimeout(this._ht);this.pause();if(this.src){{this.removeAttribute('src');this.load();}}"></video>
-                  </a>
-                  <div class="meta">
-                    <div class="top-row">
-                      <a class="app-title" href="/v/{cid}">{title}</a>
-                      <a class="user-pill" href="/u/{u}">@{u}</a>
+                by_player.setdefault(c["username"], []).append(c)
+
+            def player_stats(pclips: list[dict]) -> tuple[float, int, int]:
+                rated = [x for x in pclips if x.get("rating_count", 0) > 0]
+                total_votes = sum(x["rating_count"] for x in rated)
+                weighted_sum = sum(x["rating_avg"] * x["rating_count"] for x in rated)
+                p_avg = round(weighted_sum / total_votes, 2) if total_votes > 0 else 0.0
+                newest_ts = max((x.get("created_at", 0) for x in pclips), default=0)
+                return p_avg, total_votes, newest_ts
+
+            if sort_mode == "lowest":
+                sorted_players = sorted(
+                    by_player.items(),
+                    key=lambda item: (
+                        0 if player_stats(item[1])[1] > 0 else 1,
+                        player_stats(item[1])[0],
+                        -player_stats(item[1])[2],
+                        item[0],
+                    ),
+                )
+            elif sort_mode == "most_rated":
+                sorted_players = sorted(
+                    by_player.items(),
+                    key=lambda item: (player_stats(item[1])[1], player_stats(item[1])[0], player_stats(item[1])[2], item[0]),
+                    reverse=True,
+                )
+            elif sort_mode == "oldest":
+                sorted_players = sorted(
+                    by_player.items(),
+                    key=lambda item: (min((x.get("created_at", 0) for x in item[1]), default=0), item[0]),
+                )
+            elif sort_mode == "newest":
+                sorted_players = sorted(
+                    by_player.items(),
+                    key=lambda item: (player_stats(item[1])[2], player_stats(item[1])[0], item[0]),
+                    reverse=True,
+                )
+            else:
+                sorted_players = sorted(
+                    by_player.items(),
+                    key=lambda item: (
+                        1 if player_stats(item[1])[1] > 0 else 0,
+                        player_stats(item[1])[0],
+                        player_stats(item[1])[1],
+                        player_stats(item[1])[2],
+                        item[0],
+                    ),
+                    reverse=True,
+                )
+
+            sections_html = []
+            for idx, (u_raw, pclips) in enumerate(sorted_players):
+                u = html.escape(u_raw)
+                pclips_sorted = sort_clip_list(pclips, sort_mode)
+                player_avg, total_votes, _ = player_stats(pclips_sorted)
+                if total_votes > 0:
+                    player_pct = max(0.0, min(100.0, (player_avg / 5.0) * 100.0))
+                    player_rating_badge = f"""<span class="player-rating">
+                      <span class="stars-wrap"><span class="stars-bg">&#9733;&#9733;&#9733;&#9733;&#9733;</span><span class="stars-fg" style="width:{player_pct:.1f}%">&#9733;&#9733;&#9733;&#9733;&#9733;</span></span>
+                      <strong>{player_avg:.2f}/5</strong> <span class="vote-cnt">({total_votes} rating{"s" if total_votes != 1 else ""})</span>
+                    </span>"""
+                else:
+                    player_rating_badge = '<span class="player-rating unrated">Unrated</span>'
+
+                cards_html = []
+                for c in pclips_sorted:
+                    cid = html.escape(c["id"])
+                    title = html.escape(c["title"])
+                    fdate = html.escape(c["formatted_date"])
+                    size_mb = c.get("size", 0) / (1024 * 1024)
+                    star_pill = render_star_pill(c)
+                    cards_html.append(f"""
+                    <div class="clip-card">
+                      <a class="thumb-link" href="/v/{cid}">
+                        <video muted loop playsinline preload="none" poster="/thumb/{cid}.jpg?v={c['mtime']}"
+                               data-src="/stream/{cid}?v={c['mtime']}"
+                               onmouseenter="this._ht=setTimeout(()=>{{if(!this.src)this.src=this.dataset.src;this.play().catch(()=>{{}});}},220);"
+                               onmouseleave="clearTimeout(this._ht);this.pause();if(this.src){{this.removeAttribute('src');this.load();}}"></video>
+                      </a>
+                      <div class="meta">
+                        <div class="top-row">
+                          <a class="app-title" href="/v/{cid}">{title}</a>
+                          <a class="user-pill" href="/u/{u}">@{u}</a>
+                        </div>
+                        <div class="bottom-row">
+                          <span class="sub">{fdate} &middot; {size_mb:.1f} MB</span>
+                          {star_pill}
+                        </div>
+                      </div>
+                    </div>""")
+
+                divider_html = '<hr class="player-divider">' if idx > 0 else ""
+                sections_html.append(f"""
+                {divider_html}
+                <section class="player-section">
+                  <div class="player-header">
+                    <div class="player-title-grp">
+                      <a class="player-name" href="/u/{u}">@{u}</a>
+                      {player_rating_badge}
                     </div>
-                    <div class="sub">{fdate} &middot; {size_mb:.1f} MB</div>
+                    <span class="count">{len(pclips_sorted)} clip{"s" if len(pclips_sorted) != 1 else ""}</span>
                   </div>
-                </div>""")
-            empty_msg = '<p class="empty">No public clips yet. Owners can mark clips as Public from their gallery.</p>' if not cards_html else ""
-            page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Public Clip Gallery - InstantReplay</title>
-<style>
-  body {{ margin:0; background:#0d1117; color:#e6edf3; font-family:system-ui,-apple-system,sans-serif; padding:32px 24px; }}
-  .container {{ max-width:1280px; margin:0 auto; }}
-  header {{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:24px; border-bottom:1px solid #21262d; padding-bottom:16px; }}
-  h1 {{ margin:0; font-size:24px; font-weight:600; }}
-  .count {{ color:#8b949e; font-size:14px; }}
-  .grid {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)); gap:20px; }}
-  .clip-card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; transition:border-color 0.15s; }}
-  .clip-card:hover {{ border-color:#58a6ff; }}
-  video {{ width:100%; aspect-ratio:16/9; background:#000; object-fit:cover; display:block; }}
-  .meta {{ padding:12px 14px; }}
-  .top-row {{ display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:4px; }}
-  .app-title {{ font-weight:600; font-size:15px; color:#f0f6fc; text-decoration:none; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-  .app-title:hover {{ color:#58a6ff; }}
-  .user-pill {{ font-size:12px; color:#58a6ff; background:#1f2937; padding:2px 8px; border-radius:999px; text-decoration:none; flex-shrink:0; }}
-  .sub {{ color:#8b949e; font-size:13px; }}
-  .empty {{ color:#8b949e; font-size:15px; }}
-</style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <h1>Public Clip Gallery</h1>
-      <span class="count">{len(clips)} public clip{"s" if len(clips) != 1 else ""}</span>
-    </header>
-    {empty_msg}
-    <div class="grid">{''.join(cards_html)}</div>
-  </div>
-</body>
-</html>"""
+                  <div class="grid">{''.join(cards_html)}</div>
+                </section>""")
+
+            empty_msg = '<p class="empty">No public clips yet. Owners can mark clips as Public from their gallery.</p>' if not sections_html else ""
+            page = render_template(
+                "gallery.html",
+                active_rating="active" if sort_mode not in ("lowest", "most_rated", "newest", "oldest") else "",
+                active_lowest="active" if sort_mode == "lowest" else "",
+                active_most="active" if sort_mode == "most_rated" else "",
+                active_newest="active" if sort_mode == "newest" else "",
+                active_oldest="active" if sort_mode == "oldest" else "",
+                clip_count_label=f"{len(clips)} public clip{'s' if len(clips) != 1 else ''}",
+                empty_msg=empty_msg,
+                sections_html="".join(sections_html),
+            )
             self._send_html(200, page)
             return
 
@@ -444,9 +610,21 @@ class ClipHandler(BaseHTTPRequestHandler):
                     return
 
             is_owner = self._is_owner_of(user)
-            clips = load_all_clips(username_filter=user, include_private=is_owner)
+            sort_mode = qs.get("sort", ["newest"])[0].lower()
+            clips = sort_clip_list(load_all_clips(username_filter=user, include_private=is_owner), sort_mode)
             esc_user = html.escape(user)
-            owner_badge = ""
+            rated_user_clips = [x for x in clips if x.get("rating_count", 0) > 0]
+            if rated_user_clips:
+                u_votes = sum(x["rating_count"] for x in rated_user_clips)
+                u_wsum = sum(x["rating_avg"] * x["rating_count"] for x in rated_user_clips)
+                u_avg = u_wsum / u_votes if u_votes > 0 else 0.0
+                u_pct = max(0.0, min(100.0, (u_avg / 5.0) * 100.0))
+                owner_badge = f"""<span class="player-rating">
+                  <span class="stars-wrap"><span class="stars-bg">&#9733;&#9733;&#9733;&#9733;&#9733;</span><span class="stars-fg" style="width:{u_pct:.1f}%">&#9733;&#9733;&#9733;&#9733;&#9733;</span></span>
+                  <strong>{u_avg:.2f}/5</strong> <span class="vote-cnt">({u_votes} rating{"s" if u_votes != 1 else ""})</span>
+                </span>"""
+            else:
+                owner_badge = '<span class="player-rating unrated">Unrated</span>'
 
             cards_html = []
             for c in clips:
@@ -454,6 +632,7 @@ class ClipHandler(BaseHTTPRequestHandler):
                 title = html.escape(c["title"])
                 fdate = html.escape(c["formatted_date"])
                 size_mb = c.get("size", 0) / (1024 * 1024)
+                star_pill = render_star_pill(c)
                 vis_badge = ""
                 edit_btn = ""
                 if is_owner:
@@ -478,7 +657,10 @@ class ClipHandler(BaseHTTPRequestHandler):
                     </div>
                     <div class="bottom-row">
                       <span class="sub">{fdate} &middot; {size_mb:.1f} MB</span>
-                      {edit_btn}
+                      <div class="card-right-meta">
+                        {star_pill}
+                        {edit_btn}
+                      </div>
                     </div>
                   </div>
                 </div>""")
@@ -491,58 +673,19 @@ class ClipHandler(BaseHTTPRequestHandler):
                 )
             else:
                 empty_msg = ""
-            page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>@{esc_user}'s Clips</title>
-<style>
-  body {{ margin:0; background:#0d1117; color:#e6edf3; font-family:system-ui,-apple-system,sans-serif; padding:32px 24px; }}
-  .container {{ max-width:1280px; margin:0 auto; }}
-  header {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; border-bottom:1px solid #21262d; padding-bottom:16px; flex-wrap:wrap; gap:12px; }}
-  .title-grp {{ display:flex; align-items:center; gap:12px; }}
-  h1 {{ margin:0; font-size:24px; font-weight:600; }}
-  .owner-pill {{ background:rgba(46,160,67,0.18); border:1px solid #2ea043; color:#3fb950; font-size:12px; padding:4px 10px; border-radius:999px; font-weight:500; }}
-  .nav-links {{ display:flex; align-items:center; gap:16px; font-size:14px; }}
-  .nav-links a {{ color:#58a6ff; text-decoration:none; }}
-  .nav-links a:hover {{ text-decoration:underline; }}
-  .count {{ color:#8b949e; }}
-  .grid {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(330px, 1fr)); gap:20px; }}
-  .clip-card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; transition:border-color 0.15s; }}
-  .clip-card:hover {{ border-color:#58a6ff; }}
-  video {{ width:100%; aspect-ratio:16/9; background:#000; object-fit:cover; display:block; }}
-  .meta {{ padding:12px 14px; display:flex; flex-direction:column; gap:6px; }}
-  .top-row {{ display:flex; justify-content:space-between; align-items:center; gap:8px; }}
-  .bottom-row {{ display:flex; justify-content:space-between; align-items:center; gap:8px; }}
-  .app-title {{ font-weight:600; font-size:15px; color:#f0f6fc; text-decoration:none; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-  .app-title:hover {{ color:#58a6ff; }}
-  .vis-badge {{ font-size:11px; padding:2px 7px; border-radius:6px; font-weight:500; flex-shrink:0; }}
-  .vis-badge.pub {{ background:rgba(56,139,253,0.18); color:#58a6ff; border:1px solid rgba(56,139,253,0.4); }}
-  .vis-badge.priv {{ background:rgba(139,148,158,0.15); color:#8b949e; border:1px solid #30363d; }}
-  .edit-link {{ font-size:12px; color:#58a6ff; text-decoration:none; background:#21262d; padding:3px 9px; border-radius:6px; border:1px solid #30363d; }}
-  .edit-link:hover {{ border-color:#58a6ff; }}
-  .sub {{ color:#8b949e; font-size:13px; }}
-  .empty {{ color:#8b949e; font-size:15px; }}
-</style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div class="title-grp">
-        <h1>@{esc_user}</h1>
-        {owner_badge}
-      </div>
-      <div class="nav-links">
-        <a href="/gallery">Public Gallery</a>
-        <span class="count">{len(clips)} clip{"s" if len(clips) != 1 else ""}</span>
-      </div>
-    </header>
-    {empty_msg}
-    <div class="grid">{''.join(cards_html)}</div>
-  </div>
-</body>
-</html>"""
+            page = render_template(
+                "user_gallery.html",
+                esc_user=esc_user,
+                owner_badge=owner_badge,
+                u_act_rating="active" if sort_mode == "rating" else "",
+                u_act_lowest="active" if sort_mode == "lowest" else "",
+                u_act_most="active" if sort_mode == "most_rated" else "",
+                u_act_newest="active" if sort_mode not in ("rating", "lowest", "most_rated", "oldest") else "",
+                u_act_oldest="active" if sort_mode == "oldest" else "",
+                clip_count_label=f"{len(clips)} clip{'s' if len(clips) != 1 else ''}",
+                empty_msg=empty_msg,
+                cards_html="".join(cards_html),
+            )
             self._send_html(200, page)
             return
 
@@ -556,6 +699,13 @@ class ClipHandler(BaseHTTPRequestHandler):
 
             username = meta["username"]
             is_owner = self._is_owner_of(username, qs.get("token", [""])[0])
+            rater_id, new_rater_cookie = self._get_rater_id()
+            my_rating = meta["ratings"].get(rater_id)
+            rating_avg = meta["rating_avg"]
+            rating_count = meta["rating_count"]
+            rating_pct = max(0.0, min(100.0, (rating_avg / 5.0) * 100.0))
+            rating_summary_txt = f"{rating_avg:.2f}/5 ({rating_count} rating{'s' if rating_count != 1 else ''})" if rating_count > 0 else "No ratings yet"
+            my_rating_txt = f"Your rating: {my_rating:.1f}/5" if my_rating is not None else "Click or drag stars to rate (0.5 steps)"
 
             esc_title = html.escape(meta["title"])
             esc_app = html.escape(meta["app_name"])
@@ -580,335 +730,37 @@ class ClipHandler(BaseHTTPRequestHandler):
             edit_toggle_btn = ""
             if is_owner:
                 edit_toggle_btn = '<button type="button" class="badge btn-toggle-edit" id="btnToggleEditor">Trim / Edit</button>'
-                pub_checked = "checked" if is_pub else ""
-                priv_checked = "" if is_pub else "checked"
-                editor_html = f"""
-    <div id="editor" class="editor-panel" style="display:none;">
-      <div class="editor-header">
-        <h3>Trim &amp; Edit Clip</h3>
-        <div class="quick-actions">
-          <button type="button" class="btn btn-secondary" id="btnLoopPreview">Loop Selection: Off</button>
-          <button type="button" class="btn btn-danger" id="btnDeleteClip">Delete Clip</button>
-        </div>
-      </div>
+                editor_html = render_template(
+                    "editor.html",
+                    clip_id=clip_id,
+                    esc_title=esc_title,
+                    esc_user=esc_user,
+                    pub_checked="checked" if is_pub else "",
+                    priv_checked="" if is_pub else "checked",
+                )
 
-      <!-- Draggable Dual-Handle Timeline Bar -->
-      <div class="timeline-wrap">
-        <div class="timeline-track" id="timelineTrack">
-          <div class="timeline-selection" id="timelineSelection"></div>
-          <div class="timeline-playhead" id="timelinePlayhead"></div>
-          <div class="timeline-handle left" id="handleStart" title="Drag Start Time"></div>
-          <div class="timeline-handle right" id="handleEnd" title="Drag End Time"></div>
-        </div>
-        <div class="time-inputs">
-          <label>Start (s):
-            <input type="number" id="inputStart" step="0.1" min="0" value="0.0">
-          </label>
-          <span class="duration-readout" id="trimDurationLabel">Selected: -- s</span>
-          <label>End (s):
-            <input type="number" id="inputEnd" step="0.1" min="0.1" value="0.0">
-          </label>
-        </div>
-      </div>
-
-      <!-- Save / Visibility Options -->
-      <div class="settings-row">
-        <div class="field-group">
-          <label for="inputTitle">Clip Title / Game Name</label>
-          <input type="text" id="inputTitle" value="{esc_title}" maxlength="80">
-        </div>
-        <div class="field-group">
-          <label>Visibility</label>
-          <div class="radio-group">
-            <label class="radio-opt">
-              <input type="radio" name="visMode" value="private" {priv_checked}>
-              Private (Link Only)
-            </label>
-            <label class="radio-opt">
-              <input type="radio" name="visMode" value="public" {pub_checked}>
-              Public (Show in Gallery)
-            </label>
-          </div>
-        </div>
-      </div>
-
-      <div class="save-actions">
-        <button type="button" class="btn btn-secondary" id="btnSaveMetaOnly">Save Title / Visibility Only</button>
-        <button type="button" class="btn btn-primary" id="btnSaveCopy">Trim &amp; Save as New Copy</button>
-        <button type="button" class="btn btn-warning" id="btnOverwrite">Trim &amp; Overwrite Original</button>
-      </div>
-      <div id="editorStatus" class="status-msg"></div>
-    </div>
-
-    <script>
-    (() => {{
-      const editorPanel = document.getElementById('editor');
-      const btnToggleEditor = document.getElementById('btnToggleEditor');
-      const video = document.getElementById('clipVideo');
-      const track = document.getElementById('timelineTrack');
-      const selBox = document.getElementById('timelineSelection');
-      const playhead = document.getElementById('timelinePlayhead');
-      const hStart = document.getElementById('handleStart');
-      const hEnd = document.getElementById('handleEnd');
-      const inStart = document.getElementById('inputStart');
-      const inEnd = document.getElementById('inputEnd');
-      const durLabel = document.getElementById('trimDurationLabel');
-      const btnLoop = document.getElementById('btnLoopPreview');
-      const inTitle = document.getElementById('inputTitle');
-      const statusEl = document.getElementById('editorStatus');
-
-      let duration = 0;
-      let startSec = 0;
-      let endSec = 0;
-      let loopPreview = false;
-      let dragging = null;
-
-      function toggleEditor(forceOpen) {{
-        const open = (typeof forceOpen === 'boolean') ? forceOpen : (editorPanel.style.display === 'none');
-        editorPanel.style.display = open ? 'flex' : 'none';
-        if (btnToggleEditor) btnToggleEditor.textContent = open ? 'Close Editor' : 'Trim / Edit';
-        if (open) syncUI();
-      }}
-      if (btnToggleEditor) {{
-        btnToggleEditor.addEventListener('click', () => toggleEditor());
-      }}
-      if (window.location.hash === '#editor') {{
-        toggleEditor(true);
-      }}
-
-      function clamp(v, lo, hi) {{ return Math.max(lo, Math.min(hi, v)); }}
-
-      function syncUI() {{
-        if (duration <= 0) return;
-        const leftPct = (startSec / duration) * 100;
-        const rightPct = (endSec / duration) * 100;
-        selBox.style.left = leftPct + '%';
-        selBox.style.width = Math.max(0, rightPct - leftPct) + '%';
-        hStart.style.left = leftPct + '%';
-        hEnd.style.left = rightPct + '%';
-        inStart.value = startSec.toFixed(1);
-        inEnd.value = endSec.toFixed(1);
-        durLabel.textContent = 'Selected: ' + Math.max(0, endSec - startSec).toFixed(1) + 's / ' + duration.toFixed(1) + 's';
-      }}
-
-      video.addEventListener('loadedmetadata', () => {{
-        duration = video.duration || 10;
-        startSec = 0;
-        endSec = duration;
-        inStart.max = duration.toFixed(1);
-        inEnd.max = duration.toFixed(1);
-        syncUI();
-      }});
-
-      video.addEventListener('timeupdate', () => {{
-        if (duration > 0) {{
-          const pct = clamp((video.currentTime / duration) * 100, 0, 100);
-          playhead.style.left = pct + '%';
-        }}
-        if (loopPreview && video.currentTime >= endSec) {{
-          video.currentTime = startSec;
-          video.play();
-        }}
-      }});
-
-      function clientXToSec(clientX) {{
-        const rect = track.getBoundingClientRect();
-        const ratio = clamp((clientX - rect.left) / rect.width, 0, 1);
-        return ratio * duration;
-      }}
-
-      hStart.addEventListener('pointerdown', (e) => {{ dragging = 'start'; hStart.setPointerCapture(e.pointerId); e.preventDefault(); }});
-      hEnd.addEventListener('pointerdown', (e) => {{ dragging = 'end'; hEnd.setPointerCapture(e.pointerId); e.preventDefault(); }});
-
-      window.addEventListener('pointermove', (e) => {{
-        if (!dragging || duration <= 0) return;
-        const t = clientXToSec(e.clientX);
-        if (dragging === 'start') {{
-          startSec = clamp(t, 0, Math.max(0, endSec - 0.2));
-          video.currentTime = startSec;
-        }} else if (dragging === 'end') {{
-          endSec = clamp(t, Math.min(duration, startSec + 0.2), duration);
-          video.currentTime = endSec;
-        }}
-        syncUI();
-      }});
-
-      window.addEventListener('pointerup', () => {{ dragging = null; }});
-
-      inStart.addEventListener('change', () => {{
-        startSec = clamp(parseFloat(inStart.value) || 0, 0, Math.max(0, endSec - 0.2));
-        video.currentTime = startSec;
-        syncUI();
-      }});
-
-      inEnd.addEventListener('change', () => {{
-        endSec = clamp(parseFloat(inEnd.value) || duration, Math.min(duration, startSec + 0.2), duration);
-        video.currentTime = endSec;
-        syncUI();
-      }});
-
-      btnLoop.addEventListener('click', () => {{
-        loopPreview = !loopPreview;
-        btnLoop.textContent = 'Loop Selection: ' + (loopPreview ? 'On' : 'Off');
-        if (loopPreview) {{
-          video.currentTime = startSec;
-          video.play();
-        }}
-      }});
-
-      function getSelectedPublic() {{
-        const r = document.querySelector('input[name="visMode"]:checked');
-        return r && r.value === 'public';
-      }}
-
-      async function submitEdit(mode) {{
-        statusEl.textContent = mode === 'meta' ? 'Saving settings...' : 'Rendering trimmed video on server...';
-        statusEl.className = 'status-msg info';
-        try {{
-          const endpoint = mode === 'meta' ? '/api/clips/{clip_id}/meta' : '/api/clips/{clip_id}/trim';
-          const resp = await fetch(endpoint, {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{
-              start_sec: startSec,
-              end_sec: endSec,
-              mode: mode,
-              title: inTitle.value.trim(),
-              public: getSelectedPublic()
-            }})
-          }});
-          const data = await resp.json();
-          if (!resp.ok) throw new Error(data.error || 'Request failed');
-          if (mode === 'copy' && data.id) {{
-            statusEl.textContent = 'Saved new copy! Redirecting...';
-            window.location.href = '/v/' + data.id;
-          }} else {{
-            statusEl.textContent = 'Saved! Reloading...';
-            window.location.reload();
-          }}
-        }} catch (err) {{
-          statusEl.textContent = 'Error: ' + err.message;
-          statusEl.className = 'status-msg err';
-        }}
-      }}
-
-      document.getElementById('btnSaveMetaOnly').addEventListener('click', () => submitEdit('meta'));
-      document.getElementById('btnSaveCopy').addEventListener('click', () => submitEdit('copy'));
-      document.getElementById('btnOverwrite').addEventListener('click', () => {{
-        if (confirm('Overwrite original video clip with this trimmed range?')) {{
-          submitEdit('overwrite');
-        }}
-      }});
-
-      document.getElementById('btnDeleteClip').addEventListener('click', async () => {{
-        if (!confirm('Permanently delete this clip?')) return;
-        const resp = await fetch('/api/clips/{clip_id}', {{ method: 'DELETE' }});
-        if (resp.ok) window.location.href = '/u/{esc_user}';
-      }});
-    }})();
-    </script>"""
-
-            page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{og_title}</title>
-<meta property="og:title" content="{og_title}">
-<meta property="og:description" content="{og_desc}">
-<meta property="og:site_name" content="@{esc_user} on InstantReplay">
-<meta property="og:type" content="video.other">
-<meta property="og:url" content="{page_url}">
-<meta property="og:image" content="{thumb_url}">
-<meta property="og:video" content="{raw_url}">
-<meta property="og:video:url" content="{raw_url}">
-<meta property="og:video:secure_url" content="{raw_url}">
-<meta property="og:video:type" content="video/mp4">
-<meta property="og:video:width" content="1920">
-<meta property="og:video:height" content="1080">
-<meta name="twitter:card" content="player">
-<meta name="twitter:title" content="{og_title}">
-<meta name="twitter:description" content="{og_desc}">
-<meta name="twitter:image" content="{thumb_url}">
-<meta name="twitter:player:width" content="1920">
-<meta name="twitter:player:height" content="1080">
-<meta name="twitter:player:stream" content="{raw_url}">
-<meta name="twitter:player:stream:content_type" content="video/mp4">
-<meta name="theme-color" content="#58a6ff">
-<style>
-  body {{ margin:0; background:#0d1117; color:#e6edf3; font-family:system-ui,-apple-system,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; padding:20px; box-sizing:border-box; }}
-  .card {{ max-width:95vw; width:1120px; background:#161b22; border:1px solid #30363d; border-radius:12px; padding:18px; box-shadow:0 8px 28px rgba(0,0,0,0.45); }}
-  video {{ width:100%; max-height:74vh; border-radius:8px; background:#000; display:block; }}
-  .bar {{ display:flex; justify-content:space-between; align-items:center; margin-top:14px; gap:12px; flex-wrap:wrap; }}
-  .info {{ display:flex; flex-direction:column; gap:4px; }}
-  .title-line {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
-  .app-name {{ font-size:18px; font-weight:600; color:#f0f6fc; }}
-  .sub-app {{ font-size:12px; color:#8b949e; }}
-  .date-line {{ font-size:13px; color:#8b949e; }}
-  .vis-pill {{ font-size:11px; padding:2px 8px; border-radius:999px; font-weight:500; }}
-  .vis-pill.pub {{ background:rgba(56,139,253,0.18); color:#58a6ff; border:1px solid rgba(56,139,253,0.4); }}
-  .vis-pill.priv {{ background:rgba(139,148,158,0.15); color:#8b949e; border:1px solid #30363d; }}
-  .actions {{ display:flex; align-items:center; gap:12px; font-size:14px; }}
-  .badge {{ background:#21262d; border:1px solid #30363d; padding:6px 12px; border-radius:6px; color:#c9d1d9; text-decoration:none; font-family:inherit; font-size:14px; cursor:pointer; }}
-  .badge:hover {{ border-color:#58a6ff; color:#58a6ff; }}
-  a.dl {{ color:#58a6ff; text-decoration:none; font-weight:500; }}
-  a.dl:hover {{ text-decoration:underline; }}
-
-  /* Owner Trimmer & Studio */
-  .editor-panel {{ margin-top:20px; padding-top:18px; border-top:1px solid #30363d; display:flex; flex-direction:column; gap:16px; }}
-  .editor-header {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; }}
-  .editor-header h3 {{ margin:0; font-size:16px; }}
-  .sub-hint {{ font-weight:400; color:#8b949e; font-size:13px; }}
-  .quick-actions {{ display:flex; gap:8px; }}
-  .timeline-wrap {{ display:flex; flex-direction:column; gap:10px; background:#0d1117; padding:14px; border-radius:8px; border:1px solid #21262d; }}
-  .timeline-track {{ position:relative; height:28px; background:#21262d; border-radius:6px; user-select:none; touch-action:none; cursor:pointer; }}
-  .timeline-selection {{ position:absolute; top:0; bottom:0; background:rgba(56,139,253,0.32); border-top:2px solid #58a6ff; border-bottom:2px solid #58a6ff; pointer-events:none; }}
-  .timeline-playhead {{ position:absolute; top:-3px; bottom:-3px; width:2px; background:#f0f6fc; pointer-events:none; }}
-  .timeline-handle {{ position:absolute; top:-4px; bottom:-4px; width:14px; margin-left:-7px; background:#58a6ff; border:2px solid #f0f6fc; border-radius:4px; cursor:ew-resize; z-index:3; }}
-  .timeline-handle:hover {{ background:#79c0ff; }}
-  .time-inputs {{ display:flex; justify-content:space-between; align-items:center; font-size:13px; color:#c9d1d9; flex-wrap:wrap; gap:8px; }}
-  .time-inputs input {{ width:80px; background:#161b22; border:1px solid #30363d; color:#f0f6fc; border-radius:5px; padding:4px 8px; font-size:13px; margin-left:4px; }}
-  .duration-readout {{ color:#58a6ff; font-weight:500; }}
-  .settings-row {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
-  @media (max-width:700px) {{ .settings-row {{ grid-template-columns:1fr; }} }}
-  .field-group {{ display:flex; flex-direction:column; gap:6px; font-size:13px; }}
-  .field-group label {{ color:#8b949e; font-weight:500; }}
-  .field-group input[type="text"] {{ background:#0d1117; border:1px solid #30363d; color:#f0f6fc; border-radius:6px; padding:8px 10px; font-size:14px; }}
-  .radio-group {{ display:flex; gap:16px; align-items:center; padding-top:4px; flex-wrap:wrap; }}
-  .radio-opt {{ display:flex; align-items:center; gap:6px; color:#e6edf3 !important; cursor:pointer; }}
-  .save-actions {{ display:flex; gap:10px; flex-wrap:wrap; }}
-  .btn {{ border:1px solid #30363d; border-radius:6px; padding:8px 14px; font-size:13px; font-weight:600; cursor:pointer; color:#f0f6fc; background:#21262d; }}
-  .btn:hover {{ filter:brightness(1.12); }}
-  .btn-primary {{ background:#238636; border-color:#2ea043; }}
-  .btn-warning {{ background:#9e6a03; border-color:#bb8009; }}
-  .btn-danger {{ background:#da3633; border-color:#f85149; }}
-  .status-msg {{ font-size:13px; min-height:18px; }}
-  .status-msg.info {{ color:#58a6ff; }}
-  .status-msg.err {{ color:#f85149; }}
-</style>
-</head>
-<body>
-  <div class="card">
-    <video id="clipVideo" controls autoplay playsinline preload="auto" poster="/thumb/{clip_id}.jpg?v={mtime}" src="/stream/{clip_id}?v={mtime}"></video>
-    <div class="bar">
-      <div class="info">
-        <div class="title-line">
-          <span class="app-name">{esc_title}</span>
-          {vis_pill}
-        </div>
-        <span class="date-line">{esc_date} &middot; Recorded in {esc_app}</span>
-      </div>
-      <div class="actions">
-        {edit_toggle_btn}
-        <a class="badge" href="/u/{esc_user}">@{esc_user}'s Gallery</a>
-        <a class="dl" href="/f/{clip_id}.mp4?v={mtime}" download>Download</a>
-      </div>
-    </div>
-    {editor_html}
-  </div>
-</body>
-</html>"""
-            self._send_html(200, page)
+            page = render_template(
+                "clip.html",
+                og_title=og_title,
+                og_desc=og_desc,
+                esc_user=esc_user,
+                page_url=page_url,
+                thumb_url=thumb_url,
+                raw_url=raw_url,
+                clip_id=clip_id,
+                mtime=mtime,
+                esc_title=esc_title,
+                vis_pill=vis_pill,
+                esc_date=esc_date,
+                esc_app=esc_app,
+                rating_pct=f"{rating_pct:.1f}",
+                rating_summary_txt=rating_summary_txt,
+                my_rating_txt=my_rating_txt,
+                edit_toggle_btn=edit_toggle_btn,
+                editor_html=editor_html,
+            )
+            extra_hdrs = {"Set-Cookie": new_rater_cookie} if new_rater_cookie else None
+            self._send_html(200, page, extra_headers=extra_hdrs)
             return
 
         if path.startswith("/thumb/") and path.endswith(".jpg"):
@@ -1000,6 +852,50 @@ class ClipHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+
+        # Submit or update a decimal 0.00 - 5.00 star rating on a clip
+        if path.startswith("/api/clips/") and path.endswith("/rate"):
+            clip_id = path[len("/api/clips/"):-len("/rate")].strip("/")
+            meta = load_clip_meta(clip_id)
+            if not meta:
+                self._send_json(404, {"error": "clip not found"})
+                return
+            body = self._read_json_body()
+            if not body or "rating" not in body:
+                self._send_json(400, {"error": "rating required"})
+                return
+            try:
+                val = round(float(body["rating"]) * 2.0) / 2.0
+            except (ValueError, TypeError):
+                self._send_json(400, {"error": "invalid rating value"})
+                return
+            if val < 0.5 or val > 5.0:
+                self._send_json(400, {"error": "rating must be between 0.5 and 5.0 in 0.5 steps"})
+                return
+
+            rater_id, new_cookie = self._get_rater_id()
+            ratings = dict(meta.get("ratings", {}))
+            ratings[rater_id] = val
+            meta["ratings"] = ratings
+            meta["rating_count"] = len(ratings)
+            meta["rating_avg"] = round(sum(ratings.values()) / len(ratings), 2)
+            save_clip_meta(meta)
+
+            payload = {
+                "id": clip_id,
+                "my_rating": val,
+                "rating_avg": meta["rating_avg"],
+                "rating_count": meta["rating_count"],
+            }
+            resp_bytes = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(resp_bytes)))
+            if new_cookie:
+                self.send_header("Set-Cookie", new_cookie)
+            self.end_headers()
+            self._write_body(resp_bytes)
+            return
 
         # Metadata-only update (title / public-private toggle)
         if path.startswith("/api/clips/") and path.endswith("/meta"):
@@ -1231,9 +1127,24 @@ class ClipHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"deleted": clip_id})
 
 
+class DualStackThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except Exception:
+            pass
+        super().server_bind()
+
+
 if __name__ == "__main__":
-    print(f"InstantReplay Share Server v2.0 listening on http://0.0.0.0:{PORT}")
+    print(f"InstantReplay Share Server v2.0 listening on http://[::]:{PORT} (IPv4 + IPv6)")
     print(f"  Storage directory : {DATA_DIR}")
     print(f"  Public base URL   : {PUBLIC_URL}")
-    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), ClipHandler)
+    try:
+        httpd = DualStackThreadingHTTPServer(("::", PORT), ClipHandler)
+    except Exception:
+        httpd = ThreadingHTTPServer(("0.0.0.0", PORT), ClipHandler)
     httpd.serve_forever()
